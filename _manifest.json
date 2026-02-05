@@ -1,0 +1,46 @@
+{
+  "manifest_version": 1,
+  "name": "桌游搜索插件 (bgg search plugin)",
+  "version": "0.0.2",
+  "description": "利用 DDGS 和 LLM 查询桌游英文名，然后从 BGG 网站获取游戏的相关基本信息",
+  "author": {
+    "name": "山上的小丘",
+    "url": "https://github.com/fsqhn"
+  },
+  "license": "GPL-v3.0-or-later",
+  "host_application": {
+    "min_version": "0.10.0"
+  },
+  "homepage_url": "https://github.com/fsqhn/maibot-bgg-plugin",
+  "repository_url": "https://github.com/fsqhn/maibot-bgg-plugin",
+  "keywords": [
+    "桌游",
+    "DuckDuckGo",
+    "search",
+    "boardgame",
+    "bgg"
+  ],
+  "categories": [
+    "Utility Tools",
+    "Other",
+    "Entertainment & Interaction"
+  ],
+  "plugin_info": {
+    "is_built_in": false,
+    "plugin_type": "Other",
+    "components": [
+      {
+        "type": "command",
+        "name": "boardgame",
+        "description": "查询桌游相关信息",
+        "pattern": "/桌游"
+      },
+      {
+        "type": "tool",
+        "name": "boardgame_query",
+        "description": "供 LLM 调用的工具：根据桌游名称查询 BGG 详细信息（支持中文名/英文名/黑话）"
+      }
+    ]
+  },
+  "id": "fsqhn.bgg_search_plugin"
+}

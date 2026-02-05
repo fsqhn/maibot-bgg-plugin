@@ -1,0 +1,17 @@
+# Python 通用
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+*.log
+
+# MaiBot 插件运行生成的配置文件（通常包含你的个人配置/代理）
+config.toml
+
+# 其他你不想上传的东西
+.DS_Store
+Thumbs.db
