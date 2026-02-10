@@ -22,6 +22,14 @@ async def fetch_english_candidates_from_ddg(
 
         if verbose:
             logger.info(f"[DDGS 搜索] 共获取 {len(results)} 条结果")
+            # 新增：显示每条搜索结果
+            logger.info("[DDGS 搜索] 搜索结果详情：")
+            for idx, r in enumerate(results):
+                title = r.get("title", "")
+                body = r.get("body", "")
+                logger.info(f"  结果 {idx+1}:")
+                logger.info(f"    标题: {title}")
+                logger.info(f"    摘要: {body[:150]}{'...' if len(body) > 150 else ''}")
 
         models = llm_api.get_available_models()
         if not models:
@@ -64,12 +72,16 @@ async def fetch_english_candidates_from_ddg(
 
         if verbose:
             logger.info("[LLM 提取] 正在调用LLM处理搜索结果...")
+            logger.info(f"[LLM 提取] 发送给 LLM 的 prompt（前500字符）: {prompt[:500]}...")
 
         success, llm_response, _, used_model = await llm_api.generate_with_model(
             prompt=prompt,
             model_config=model_config,
             request_type="plugin.generate",
         )
+
+        if verbose:
+            logger.info(f"[LLM 提取] LLM 原始响应: {llm_response}")
 
         if not success or not llm_response or not llm_response.strip():
             raise ValueError("LLM生成失败或返回空结果")
@@ -116,7 +128,7 @@ async def fetch_english_candidates_from_ddg(
                 unique_candidates.append(name)
 
         if verbose:
-            logger.info(f"[LLM 提取] 中文名: {cn_name}, 英文名候选: {unique_candidates}")
+            logger.info(f"[LLM 提取] 最终提取结果 - 中文名: {cn_name}, 英文名候选: {unique_candidates}")
         return unique_candidates, cn_name
 
     except Exception as e:

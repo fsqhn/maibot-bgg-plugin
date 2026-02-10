@@ -1,4 +1,6 @@
-from typing import List, Tuple, Type
+import os
+from typing import List, Tuple, Type  # 必须这样写，不能换
+
 from src.plugin_system import (
     BasePlugin,
     register_plugin,
@@ -12,9 +14,9 @@ from src.common.logger import get_logger
 import httpx
 import base64
 
-
 from .bgg_client import bgg_thing_details_api, resolve_boardgame_by_cn_name
 from .utils import load_terms
+from .register import BoardgameRegisterCommand  # 确保 register 文件也是正确的
 
 logger = get_logger("bgg_search_plugin")
 
@@ -65,11 +67,14 @@ class BoardgameQueryTool(BaseTool):
         if bgg_failed:
             en_name = details.get("name", "")
             cn_name = details.get("cn_name", query)
+            name_source = details.get("_name_source", "未知")
+            bgg_source = details.get("_bgg_source", "未知")
             return {
                 "name": self.name,
                 "content": (
                     f"找到了桌游「{cn_name}」（英文名：{en_name}），"
-                    "但暂时无法从 BGG 获取详细信息（评分、排名、人数等）。"
+                    f"但暂时无法从 BGG 获取详细信息（评分、排名、人数等）。\n"
+                    f"数据来源：名称来自{name_source}，详情来源{bgg_source}"
                 ),
             }
 
@@ -90,6 +95,10 @@ class BoardgameQueryTool(BaseTool):
         lang_dependence = details.get("language_dependence", "")
         cn_name = details.get("cn_name", query)
         en_name = details.get("name", "")
+        
+        # 新增：获取数据来源信息
+        name_source = details.get("_name_source", "未知")
+        bgg_source = details.get("_bgg_source", "未知")
 
         desc_display = desc or "暂无简介"
         types_str = ", ".join(categories[:6])
@@ -116,6 +125,7 @@ class BoardgameQueryTool(BaseTool):
             f"机制：{mechanics_str}",
             f"简介：{desc_display}",
             f"BGG 链接：{bgg_url}",
+            f"数据来源：名称来自{name_source}，详情来自{bgg_source}",
         ])
 
         content = "\n".join(lines)
@@ -141,6 +151,8 @@ class BoardgameQueryTool(BaseTool):
                 "mechanics": mechanics,
                 "description": desc_display,
                 "bgg_url": bgg_url,
+                "name_source": name_source,
+                "bgg_source": bgg_source,
             },
         }
 
@@ -165,28 +177,31 @@ class BoardgameCommand(BaseCommand):
         ddgs_proxy = self.get_config("ddgs.proxy", None)
         verbose = self.get_config("plugin.verbose_logging", True)
         enable_ai_translate = self.get_config("ai_translate.enabled", False)
-        
 
         details = await resolve_boardgame_by_cn_name(
             cn_name=keyword,
             proxy=ddgs_proxy,
             verbose=verbose,
-
         )
 
         bgg_failed = details.get("bgg_failed", False)
-        source = details.get("_source", "Unknown")
-
+        
+        # 新增：获取数据来源信息
+        name_source = details.get("_name_source", "未知")
+        bgg_source = details.get("_bgg_source", "未知")
+        
         en_name = details.get("name", "")
         cn_name = details.get("cn_name", keyword)
 
         if bgg_failed:
+            # 构建数据来源说明
+            source_text = f"📛 名称来源：{name_source}\n📚 详情来源：{bgg_source}"
             text = (
                 f"🇨🇳 中文名：{cn_name}\n"
                 f"🇺🇸 英文名：{en_name}\n"
                 f"\n"
                 f"⚠️ 注意：BGG 暂时无法访问，未能获取详细信息（评分、排名、玩家数等）\n"
-                f"🔗 数据来源：DuckDuckGo 搜索 + LLM 提取"
+                f"{source_text}"
             )
             await self.send_text(text)
             return True, f"已提取桌游信息（BGG未响应）：{en_name}", True
@@ -286,6 +301,9 @@ class BoardgameCommand(BaseCommand):
             desc_display = translated_desc
 
         final_query = details.get("_final_query", "")
+        
+        # 新增：构建数据来源说明
+        source_text = f"📛 名称来源：{name_source} | 📚 详情来源：{bgg_source}"
 
         text = (
             f"🇨🇳 中文名：{cn_name}\n"
@@ -305,7 +323,7 @@ class BoardgameCommand(BaseCommand):
 
         text += (
             f"📝 简介：{desc_display}\n"
-            f"🔗 数据来源：{source}\n"
+            f"{source_text}\n"
             f"🔗 BGG 链接：{bgg_url}"
         )
 
@@ -348,7 +366,7 @@ class BoardgameCommand(BaseCommand):
 class bggsearchplugin(BasePlugin):
     """bgg_search_plugin插件 - 桌游信息查询"""
 
-    plugin_name: str = "bgg_search_plugin"
+    plugin_name: str = "fsqhn_bgg_search_plugin"
     enable_plugin: bool = True
     dependencies: List[str] = []
     
@@ -398,8 +416,11 @@ class bggsearchplugin(BasePlugin):
     }
 
     def get_plugin_components(self) -> List[Tuple[ComponentInfo, Type]]:
+    
         return [
             (BoardgameCommand.get_command_info(), BoardgameCommand),
             (BoardgameQueryTool.get_tool_info(), BoardgameQueryTool),
+            (BoardgameRegisterCommand.get_command_info(), BoardgameRegisterCommand),
         ]
+
 
