@@ -333,8 +333,13 @@ async def resolve_boardgame_by_cn_name(
     alias_dict = load_alias()
     raw = alias_dict.get(cn_name, "").strip()
     candidates = []
+    from_alias = False  # 新增：标记是否来自词典
+    
     if raw:
         candidates = [c.strip() for c in raw.split("|") if c.strip()]
+        from_alias = True  # 标记来自词典
+        if verbose:
+            logger.info(f"[数据来源] 从本地词典找到英文名候选: {candidates}")
 
     extracted_cn_name = cn_name
     if not candidates:
@@ -344,6 +349,8 @@ async def resolve_boardgame_by_cn_name(
             verbose=verbose,
         )
         candidates.extend(ddg_candidates)
+        if verbose:
+            logger.info(f"[数据来源] 从 DDG+AI 提取英文名候选: {candidates}")
 
     if not candidates:
         return None
@@ -361,7 +368,10 @@ async def resolve_boardgame_by_cn_name(
                     if details:
                         details["_final_query"] = q
                         details["cn_name"] = extracted_cn_name
-                        details["_source"] = "API"
+                        # 新增：记录完整的数据来源
+                        details["_source"] = f"词典→BGG_API" if from_alias else "DDG+AI→BGG_API"
+                        details["_name_source"] = "词典" if from_alias else "DDG+AI"
+                        details["_bgg_source"] = "BGG_API"
                         if verbose:
                             logger.info(f"[API 成功] 使用查询词 '{q}' 获取到数据")
                         return details
@@ -389,7 +399,9 @@ async def resolve_boardgame_by_cn_name(
                 "name": candidates[0] if candidates else "",
                 "cn_name": extracted_cn_name,
                 "bgg_failed": True,
-                "_source": "LLM Only",
+                "_source": f"词典→仅LLM" if from_alias else "DDG+AI→仅LLM",
+                "_name_source": "词典" if from_alias else "DDG+AI",
+                "_bgg_source": "仅LLM",
             }
 
         details = await web_thing_details(
@@ -402,7 +414,10 @@ async def resolve_boardgame_by_cn_name(
         if details:
             details["_final_query"] = final_query
             details["cn_name"] = extracted_cn_name
-            details["_source"] = "Web Scraping"
+            # 新增：记录完整的数据来源
+            details["_source"] = f"词典→网页抓取" if from_alias else "DDG+AI→网页抓取"
+            details["_name_source"] = "词典" if from_alias else "DDG+AI"
+            details["_bgg_source"] = "网页抓取"
         else:
             return {
                 "name": search_result.get("name", ""),
@@ -410,7 +425,9 @@ async def resolve_boardgame_by_cn_name(
                 "cn_name": extracted_cn_name,
                 "bgg_url": search_result.get("url", ""),
                 "bgg_failed": True,
-                "_source": "Web Search Only",
+                "_source": f"词典→网页搜索" if from_alias else "DDG+AI→网页搜索",
+                "_name_source": "词典" if from_alias else "DDG+AI",
+                "_bgg_source": "网页搜索",
             }
 
         return details
