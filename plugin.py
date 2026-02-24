@@ -1,5 +1,5 @@
 import os
-from typing import List, Tuple, Type  # 必须这样写，不能换
+from typing import List, Tuple, Type
 
 from src.plugin_system import (
     BasePlugin,
@@ -16,7 +16,7 @@ import base64
 
 from .bgg_client import bgg_thing_details_api, resolve_boardgame_by_cn_name
 from .utils import load_terms
-from .register import BoardgameRegisterCommand  # 确保 register 文件也是正确的
+from .register import BoardgameRegisterCommand
 
 logger = get_logger("bgg_search_plugin")
 
@@ -50,11 +50,13 @@ class BoardgameQueryTool(BaseTool):
 
         ddgs_proxy = self.get_config("ddgs.proxy", None)
         verbose = self.get_config("plugin.verbose_logging", False)
+        jishi_cookie = self.get_config("jishi.cookie", "")
 
         details = await resolve_boardgame_by_cn_name(
             cn_name=query,
             proxy=ddgs_proxy,
             verbose=verbose,
+            jishi_cookie=jishi_cookie,
         )
 
         if not details:
@@ -78,6 +80,7 @@ class BoardgameQueryTool(BaseTool):
                 ),
             }
 
+        # 数据提取
         year = details.get("year", "")
         rank = details.get("rank", "N/A")
         avg = details.get("average", "N/A")
@@ -92,15 +95,23 @@ class BoardgameQueryTool(BaseTool):
         categories = details.get("categories", [])
         mechanics = details.get("mechanics", [])
         best_numplayers = details.get("best_numplayers", "")
-        lang_dependence = details.get("language_dependence", "")
+        lang_dependence = details.get("language_dependence", "") # BGG 的
         cn_name = details.get("cn_name", query)
         en_name = details.get("name", "")
         
-        # 新增：获取数据来源信息
+        # 来源信息
         name_source = details.get("_name_source", "未知")
         bgg_source = details.get("_bgg_source", "未知")
 
-        desc_display = desc or "暂无简介"
+        # 集石特有数据
+        cn_desc = details.get("cn_description")
+        jishi_score = details.get("jishi_score")
+        jishi_cats = details.get("jishi_categories", [])
+        table_req = details.get("table_requirement")
+        lang_req = details.get("language_requirement") # 集石的语言要求
+
+        # 简介：优先集石中文
+        desc_display = cn_desc if cn_desc else (desc or "暂无简介")
         types_str = ", ".join(categories[:6])
         mechanics_str = ", ".join(mechanics[:6])
 
@@ -117,8 +128,11 @@ class BoardgameQueryTool(BaseTool):
 
         if best_numplayers:
             lines.append(f"最佳游玩人数：{best_numplayers}")
-        if lang_dependence:
-            lines.append(f"语言依赖：{lang_dependence}")
+        
+        # 语言依赖：优先集石，其次 BGG
+        final_lang = lang_req if lang_req else lang_dependence
+        if final_lang:
+            lines.append(f"语言依赖：{final_lang}")
 
         lines.extend([
             f"类型：{types_str}",
@@ -146,7 +160,7 @@ class BoardgameQueryTool(BaseTool):
                 "max_time": maxt,
                 "min_age": minage,
                 "best_numplayers": best_numplayers,
-                "language_dependence": lang_dependence,
+                "language_dependence": final_lang,
                 "categories": categories,
                 "mechanics": mechanics,
                 "description": desc_display,
@@ -177,16 +191,18 @@ class BoardgameCommand(BaseCommand):
         ddgs_proxy = self.get_config("ddgs.proxy", None)
         verbose = self.get_config("plugin.verbose_logging", True)
         enable_ai_translate = self.get_config("ai_translate.enabled", False)
+        jishi_cookie = self.get_config("jishi.cookie", "")
 
         details = await resolve_boardgame_by_cn_name(
             cn_name=keyword,
             proxy=ddgs_proxy,
             verbose=verbose,
+            jishi_cookie=jishi_cookie,
         )
 
         bgg_failed = details.get("bgg_failed", False)
         
-        # 新增：获取数据来源信息
+        # 来源信息
         name_source = details.get("_name_source", "未知")
         bgg_source = details.get("_bgg_source", "未知")
         
@@ -194,7 +210,6 @@ class BoardgameCommand(BaseCommand):
         cn_name = details.get("cn_name", keyword)
 
         if bgg_failed:
-            # 构建数据来源说明
             source_text = f"📛 名称来源：{name_source}\n📚 详情来源：{bgg_source}"
             text = (
                 f"🇨🇳 中文名：{cn_name}\n"
@@ -206,6 +221,7 @@ class BoardgameCommand(BaseCommand):
             await self.send_text(text)
             return True, f"已提取桌游信息（BGG未响应）：{en_name}", True
 
+        # 提取 BGG 基础数据
         year = details.get("year", "")
         rank = details.get("rank", "N/A")
         avg = details.get("average", "N/A")
@@ -222,8 +238,16 @@ class BoardgameCommand(BaseCommand):
         categories = details.get("categories", [])
         mechanics = details.get("mechanics", [])
         best_numplayers = details.get("best_numplayers", "")
-        lang_dependence = details.get("language_dependence", "")
+        lang_dependence = details.get("language_dependence", "") # BGG
+        
+        # 提取集石特有数据
+        cn_desc = details.get("cn_description")
+        jishi_score = details.get("jishi_score")
+        jishi_cats = details.get("jishi_categories", [])
+        table_req = details.get("table_requirement")
+        lang_req = details.get("language_requirement") # 集石
 
+        # 翻译逻辑
         translated_categories = []
         translated_mechanics = []
         translated_desc = desc
@@ -295,14 +319,16 @@ class BoardgameCommand(BaseCommand):
         categories_text = "、".join(translated_categories[:5]) if translated_categories else "暂无"
         mechanics_text = "、".join(translated_mechanics[:5]) if translated_mechanics else "暂无"
 
-        if not enable_ai_translate:
-            desc_display = (desc or "暂无简介")[:200] + "..." if len(desc or "") > 200 else (desc or "暂无简介")
+        # 简介优先级：集石中文 > AI翻译 > 原文
+        if cn_desc:
+            desc_display = cn_desc
         else:
-            desc_display = translated_desc
+            if not enable_ai_translate:
+                desc_display = (desc or "暂无简介")[:200] + "..." if len(desc or "") > 200 else (desc or "暂无简介")
+            else:
+                desc_display = translated_desc
 
         final_query = details.get("_final_query", "")
-        
-        # 新增：构建数据来源说明
         source_text = f"📛 名称来源：{name_source} | 📚 详情来源：{bgg_source}"
 
         text = (
@@ -315,11 +341,22 @@ class BoardgameCommand(BaseCommand):
             f"📚 游戏类型：{categories_text}\n"
             f"⚙️ 游戏机制：{mechanics_text}\n"
         )
+        
+        if jishi_score:
+            text += f"🔥 集石评分：{jishi_score}\n"
+        if jishi_cats:
+            text += f"🏷️ 集石分类：{'、'.join(jishi_cats)}\n"
 
         if best_numplayers:
             text += f"👍 最佳人数：{best_numplayers} 人\n"
-        if lang_dependence:
-            text += f"🌍 语言依赖：{lang_dependence}\n"
+            
+        # 语言依赖：优先集石，其次 BGG
+        final_lang = lang_req if lang_req else lang_dependence
+        if final_lang:
+            text += f"🌍 语言依赖：{final_lang}\n"
+            
+        if table_req:
+            text += f"📏 桌面要求：{table_req}\n"
 
         text += (
             f"📝 简介：{desc_display}\n"
@@ -370,7 +407,6 @@ class bggsearchplugin(BasePlugin):
     enable_plugin: bool = True
     dependencies: List[str] = []
     
-    # 修正缩进：
     python_dependencies = [
         "httpx",
         "ddgs",
@@ -381,6 +417,7 @@ class bggsearchplugin(BasePlugin):
 
     config_section_descriptions = {
         "plugin": "插件启用配置",
+        "jishi": "集石数据源配置 (优先级最高，需提供Cookie)",
         "ddgs": "DuckDuckGo 搜索代理配置（如无代理可留空或删除该节）",
         "ai_translate": "AI 翻译配置（翻译类型、机制和简介）",
     }
@@ -395,14 +432,22 @@ class bggsearchplugin(BasePlugin):
             "verbose_logging": ConfigField(
                 type=bool,
                 default=False,
-                description="是否在后台显示详细日志（包括 DDG 搜索结果、AI 总结、API 返回数据等）",
+                description="是否在后台显示详细日志",
+            ),
+        },
+        "jishi": {
+            "cookie": ConfigField(
+                type=str,
+                default="",
+                description="集石(Gstone)网站的Cookie。",
+                example="PHPSESSID=xxxx; _gstone_uid=xxxx;",
             ),
         },
         "ddgs": {
             "proxy": ConfigField(
                 type=str,
                 default="",
-                description="DuckDuckGo 搜索使用的代理地址，访问BGG也会用，强烈建议配置代理，例如 'http://127.0.0.1:10809'；留空表示不使用代理",
+                description="DuckDuckGo 搜索使用的代理地址",
                 example="http://127.0.0.1:10809",
             ),
         },
@@ -410,7 +455,7 @@ class bggsearchplugin(BasePlugin):
             "enabled": ConfigField(
                 type=bool,
                 default=True,
-                description="是否开启 AI 全文翻译。开启后会翻译类型、机制和简介（效果更好但速度较慢）；关闭时仅使用内置词典翻译常用术语，简介保留英文。",
+                description="是否开启 AI 全文翻译。",
             ),
         },
     }
@@ -422,5 +467,3 @@ class bggsearchplugin(BasePlugin):
             (BoardgameQueryTool.get_tool_info(), BoardgameQueryTool),
             (BoardgameRegisterCommand.get_command_info(), BoardgameRegisterCommand),
         ]
-
-

@@ -4,6 +4,12 @@ import xml.etree.ElementTree as ET
 from .utils import make_bgg_api_headers, BGG_API_SEARCH_V2, BGG_API_SEARCH_V1, BGG_API_THING
 from src.common.logger import get_logger
 
+# 新增导入
+from .jishi_client import search_jishi_games, fetch_jishi_detail, select_best_match
+from .ddg_client import fetch_english_candidates_from_ddg
+from .web_client import bgg_search_by_name, bgg_thing_details as web_thing_details
+from .utils import load_alias
+
 logger = get_logger("bgg_search_plugin.bgg_client")
 headers = make_bgg_api_headers()  
 
@@ -271,13 +277,27 @@ async def bgg_thing_details_api(
                         best_votes = numvotes
                         best_numplayers = numplayers
 
+        # ========== 修正语言依赖解析逻辑 ==========
         lang_dependence = ""
         lang_poll = item.find(".//poll[@name='language_dependence']")
         if lang_poll is not None:
-            lang_result = lang_poll.find(".//results/result")
-            if lang_result is not None:
-                lang_value = lang_result.get("value", "")
-                lang_level = lang_result.get("level", "")
+            best_result = None
+            max_votes = -1
+            
+            # 遍历所有 result，找到票数最多的那个
+            for result_node in lang_poll.findall(".//result"):
+                try:
+                    numvotes = int(result_node.get("numvotes", "0"))
+                except ValueError:
+                    numvotes = 0
+                
+                if numvotes > max_votes:
+                    max_votes = numvotes
+                    best_result = result_node
+            
+            if best_result is not None:
+                lang_value = best_result.get("value", "")
+                lang_level = best_result.get("level", "")
                 if lang_value:
                     level_map = {
                         "1": "无需阅读",
@@ -288,8 +308,6 @@ async def bgg_thing_details_api(
                     }
                     level_text = level_map.get(lang_level, "")
                     lang_dependence = f"{lang_value}（{level_text}）" if level_text else lang_value
-                else:
-                    lang_dependence = lang_value
 
         return {
             "bgg_id": game_id,
@@ -318,48 +336,129 @@ async def bgg_thing_details_api(
         logger.error(f"[BGG API 详情异常] {e}")
         return None
 
-from .ddg_client import fetch_english_candidates_from_ddg
-from .web_client import bgg_search_by_name, bgg_thing_details as web_thing_details
-from .utils import load_alias
-import httpx
-
 
 async def resolve_boardgame_by_cn_name(
     cn_name: str,
     proxy: Optional[str] = None,
     verbose: bool = False,
     api_token: Optional[str] = None,
+    jishi_cookie: Optional[str] = None,
 ) -> Optional[dict]:
     alias_dict = load_alias()
     raw = alias_dict.get(cn_name, "").strip()
     candidates = []
-    from_alias = False  # 新增：标记是否来自词典
+    from_alias = False
     
     if raw:
         candidates = [c.strip() for c in raw.split("|") if c.strip()]
-        from_alias = True  # 标记来自词典
+        from_alias = True
         if verbose:
             logger.info(f"[数据来源] 从本地词典找到英文名候选: {candidates}")
 
     extracted_cn_name = cn_name
-    if not candidates:
-        ddg_candidates, extracted_cn_name = await fetch_english_candidates_from_ddg(
-            f"{cn_name} 桌游",
-            proxy=proxy,
-            verbose=verbose,
-        )
-        candidates.extend(ddg_candidates)
+    
+    # 集石数据源逻辑
+    jishi_result = None
+    if jishi_cookie and not from_alias:
         if verbose:
-            logger.info(f"[数据来源] 从 DDG+AI 提取英文名候选: {candidates}")
-
-    if not candidates:
-        return None
+            logger.info(f"[流程] 尝试集石数据源 (热度排序)...")
+        
+        jishi_candidates = await search_jishi_games(cn_name, jishi_cookie, proxy, verbose)
+        
+        if jishi_candidates:
+            detailed_candidates = []
+            for cand in jishi_candidates:
+                detail = await fetch_jishi_detail(cand['jishi_id'], jishi_cookie, proxy, verbose)
+                if detail:
+                    detailed_candidates.append(detail)
+            
+            if detailed_candidates:
+                best_match = select_best_match(cn_name, detailed_candidates)
+                if best_match:
+                    jishi_result = best_match
+                    if verbose:
+                        logger.info(f"[流程] 集石匹配成功: {jishi_result.get('cn_name')} (BGG ID: {jishi_result.get('bgg_id')})")
 
     client = httpx.AsyncClient(timeout=20.0, proxy=proxy)
 
     try:
+        # 情况A: 集石成功匹配到 BGG ID
+        if jishi_result and jishi_result.get("bgg_id"):
+            if verbose:
+                logger.info(f"[流程] 集石 -> BGG API")
+            
+            details = await bgg_thing_details_api(jishi_result["bgg_id"], client, verbose, api_token)
+            if details:
+                details["cn_name"] = jishi_result.get("cn_name", details.get("name"))
+                if jishi_result.get("cn_description"):
+                    details["cn_description"] = jishi_result.get("cn_description")
+                details["jishi_score"] = jishi_result.get("jishi_score")
+                details["language_requirement"] = jishi_result.get("language_requirement")
+                details["table_requirement"] = jishi_result.get("table_requirement")
+                details["jishi_categories"] = jishi_result.get("jishi_categories", [])
+                
+                details["_source"] = "集石→BGG_API"
+                details["_name_source"] = "集石"
+                details["_bgg_source"] = "BGG_API"
+                return details
+            else:
+                if verbose:
+                    logger.warning("[流程] 集石拿到BGG ID，但BGG详情获取失败")
+                return {
+                    "name": jishi_result.get("en_name", ""),
+                    "cn_name": jishi_result.get("cn_name"),
+                    "bgg_id": jishi_result.get("bgg_id"),
+                    "bgg_url": f"https://boardgamegeek.com/boardgame/{jishi_result.get('bgg_id')}",
+                    "bgg_failed": True,
+                    "cn_description": jishi_result.get("cn_description"),
+                    "jishi_score": jishi_result.get("jishi_score"),
+                    "language_requirement": jishi_result.get("language_requirement"),
+                    "_source": "集石→BGG_API(详情失败)",
+                    "_name_source": "集石",
+                    "_bgg_source": "BGG_API(失败)",
+                }
+
+        # 情况B: 集石有结果但无 BGG ID -> 用集石中文名去DDG
+        if jishi_result and not jishi_result.get("bgg_id"):
+            if verbose:
+                logger.info(f"[流程] 集石无BGG ID -> DDG兜底")
+            
+            query_for_ddg = jishi_result.get("cn_name", cn_name)
+            ddg_candidates, _ = await fetch_english_candidates_from_ddg(
+                f"{query_for_ddg} 桌游", proxy=proxy, verbose=verbose
+            )
+            candidates.extend(ddg_candidates)
+            
+            if not candidates:
+                return {
+                    "name": jishi_result.get("en_name", ""),
+                    "cn_name": jishi_result.get("cn_name"),
+                    "bgg_failed": True,
+                    "cn_description": jishi_result.get("cn_description"),
+                    "jishi_score": jishi_result.get("jishi_score"),
+                    "language_requirement": jishi_result.get("language_requirement"),
+                    "_source": "集石→DDG(无结果)",
+                    "_name_source": "集石",
+                    "_bgg_source": "无",
+                }
+            
+            extracted_cn_name = query_for_ddg
+
+        # 情况C: 集石彻底失败 或 词典模式
+        if not jishi_result and not from_alias:
+            if verbose:
+                logger.info("[流程] 集石无结果 -> DDG兜底")
+            ddg_candidates, extracted_cn_name = await fetch_english_candidates_from_ddg(
+                f"{cn_name} 桌游", proxy=proxy, verbose=verbose
+            )
+            candidates.extend(ddg_candidates)
+        
+        if not candidates:
+            return None
+
         if verbose:
             logger.info("开始尝试 BGG API 方式查询...")
+        
         for q in candidates:
             try:
                 game_id = await bgg_search_api_by_name(q, client, verbose, api_token)
@@ -368,16 +467,24 @@ async def resolve_boardgame_by_cn_name(
                     if details:
                         details["_final_query"] = q
                         details["cn_name"] = extracted_cn_name
-                        # 新增：记录完整的数据来源
-                        details["_source"] = f"词典→BGG_API" if from_alias else "DDG+AI→BGG_API"
-                        details["_name_source"] = "词典" if from_alias else "DDG+AI"
+                        
+                        if jishi_result:
+                            src = "集石→DDG→BGG_API"
+                            ns = "集石(转DDG)"
+                        elif from_alias:
+                            src = "词典→BGG_API"
+                            ns = "词典"
+                        else:
+                            src = "DDG+AI→BGG_API"
+                            ns = "DDG+AI"
+                        
+                        details["_source"] = src
+                        details["_name_source"] = ns
                         details["_bgg_source"] = "BGG_API"
-                        if verbose:
-                            logger.info(f"[API 成功] 使用查询词 '{q}' 获取到数据")
                         return details
             except Exception as e:
                 if verbose:
-                    logger.warning(f"[API 查询词 '{q}' 失败: {e}，尝试下一个或回退")
+                    logger.warning(f"[API 查询词 '{q}' 失败: {e}")
                 continue
 
         if verbose:
@@ -393,8 +500,6 @@ async def resolve_boardgame_by_cn_name(
                 break
 
         if not search_result:
-            if verbose:
-                logger.info(f"[BGG 查询失败] 返回 LLM 提取的信息")
             return {
                 "name": candidates[0] if candidates else "",
                 "cn_name": extracted_cn_name,
@@ -414,7 +519,6 @@ async def resolve_boardgame_by_cn_name(
         if details:
             details["_final_query"] = final_query
             details["cn_name"] = extracted_cn_name
-            # 新增：记录完整的数据来源
             details["_source"] = f"词典→网页抓取" if from_alias else "DDG+AI→网页抓取"
             details["_name_source"] = "词典" if from_alias else "DDG+AI"
             details["_bgg_source"] = "网页抓取"
