@@ -1,0 +1,13 @@
+[plugin]
+config_version = "1.0.0"
+
+enabled = true
+
+[jishi]
+cookie = ""
+
+[ddgs]
+proxy = ""
+
+[ai_translate]
+enabled = true
