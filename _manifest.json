@@ -1,46 +1,42 @@
 {
-  "manifest_version": 1,
-  "name": "桌游搜索插件 (bgg search plugin)",
-  "version": "0.0.2",
-  "description": "利用 DDGS 和 LLM 查询桌游英文名，然后从 BGG 网站获取游戏的相关基本信息",
+  "manifest_version": 2,
+  "name": "桌游搜索插件 (bgg_search_plugin)",
+  "version": "0.0.6",
+  "description": "利用集石、DDGS 和 LLM 查询桌游英文名，然后从 BGG 网站获取游戏的相关基本信息",
   "author": {
     "name": "山上的小丘",
     "url": "https://github.com/fsqhn"
   },
   "license": "GPL-v3.0-or-later",
+
   "host_application": {
-    "min_version": "0.10.0"
+    "min_version": "1.0.0",
+    "max_version": "1.99.99"
   },
-  "homepage_url": "https://github.com/fsqhn/maibot-bgg-plugin",
-  "repository_url": "https://github.com/fsqhn/maibot-bgg-plugin",
-  "keywords": [
-    "桌游",
-    "DuckDuckGo",
-    "search",
-    "boardgame",
-    "bgg"
-  ],
-  "categories": [
-    "Utility Tools",
-    "Other",
-    "Entertainment & Interaction"
-  ],
-  "plugin_info": {
-    "is_built_in": false,
-    "plugin_type": "Other",
-    "components": [
-      {
-        "type": "command",
-        "name": "boardgame",
-        "description": "查询桌游相关信息",
-        "pattern": "/桌游"
-      },
-      {
-        "type": "tool",
-        "name": "boardgame_query",
-        "description": "供 LLM 调用的工具：根据桌游名称查询 BGG 详细信息（支持中文名/英文名/黑话）"
-      }
-    ]
+
+  "sdk": {
+    "min_version": "1.0.0",
+    "max_version": "2.99.99"
   },
+
+  "capabilities": [
+    "llm.generate",
+	"llm.get_available_models",
+    "message.get_by_time_in_chat",
+    "config.get",
+    "send.text",
+    "send.image",
+    "send.forward"
+  ],
+
+  "i18n": {
+    "default_locale": "zh-CN"
+  },
+
+  "urls": {
+    "repository": "https://github.com/fsqhn/maibot-bgg-plugin" ,
+    "homepage": "https://github.com/fsqhn/maibot-bgg-plugin"
+  },
+
   "id": "fsqhn.bgg_search_plugin"
 }

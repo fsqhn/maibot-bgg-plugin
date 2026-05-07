@@ -26,16 +26,12 @@ BGG_API_TOKEN = "a45425e8-aee4-42f2-9111-2190723fbb2b"
 
 
 def make_bgg_api_headers(api_token: Optional[str] = None) -> dict:
-    """
-    为 BGG API 请求构造请求头。
-    如果未提供 api_token，则默认使用硬编码的 BGG_API_TOKEN。
-    """
+    """为 BGG API 请求构造请求头。"""
     headers = {
         "User-Agent": HEADERS["User-Agent"],
         "Accept": "application/xml, text/xml, */*; q=0.01",
         "Accept-Language": "en-US,en;q=0.9",
     }
-    # 优先使用传入的 token，如果没有则使用硬编码的
     token_to_use = api_token if api_token is not None else BGG_API_TOKEN
     if token_to_use:
         headers["Authorization"] = f"Bearer {token_to_use}"

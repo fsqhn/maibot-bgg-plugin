@@ -1,78 +1,221 @@
-from typing import List, Tuple, Type
-from src.plugin_system import (
-    BasePlugin,
-    register_plugin,
-    BaseCommand,
-    BaseTool,
-    ComponentInfo,
-    ConfigField,
-    ToolParamType,
-)
-from src.common.logger import get_logger
-import httpx
+from __future__ import annotations
+
+import os
 import base64
+import asyncio
+import httpx
+from typing import Any, Dict, List, Tuple, Callable, Awaitable
 
+from maibot_sdk import (
+    MaiBotPlugin,
+    Command,
+    Tool,
+    PluginConfigBase,
+    Field,
+    CONFIG_RELOAD_SCOPE_SELF,
+)
+from maibot_sdk.types import ToolParameterInfo, ToolParamType
 
-from .bgg_client import bgg_thing_details_api, resolve_boardgame_by_cn_name
+# 递归剥皮逻辑（和能跑的示例一致）
+def _peel_envelope(result: Any, *, max_depth: int = 4) -> Any:
+    for _ in range(max_depth):
+        if not isinstance(result, dict):
+            return result
+        if "result" not in result or "success" not in result:
+            return result
+        inner = result["result"]
+        if inner is None:
+            return result
+        result = inner
+    return result
+
+from .bgg_client import resolve_boardgame_by_cn_name
 from .utils import load_terms
 
-logger = get_logger("bgg_search_plugin")
+
+# ===== 配置 =====
+class PluginMetaSection(PluginConfigBase):
+    __ui_label__ = "插件元信息"
+    config_version: str = Field(default="1.0.0", description="配置版本号")
+
+class JishiSection(PluginConfigBase):
+    __ui_label__ = "集石数据源"
+    cookie: str = Field(default="", description="集石Cookie")
+
+class DdgsSection(PluginConfigBase):
+    __ui_label__ = "DDG搜索"
+    proxy: str = Field(default="", description="DDG代理地址")
+
+class AiTranslateSection(PluginConfigBase):
+    __ui_label__ = "AI翻译"
+    enabled: bool = Field(default=True, description="是否开启AI翻译")
+
+class BggSearchPluginConfig(PluginConfigBase):
+    __ui_label__ = "BGG搜索插件"
+    plugin: PluginMetaSection = Field(default_factory=PluginMetaSection)
+    enabled: bool = Field(default=True, description="是否启用")
+    verbose_logging: bool = Field(default=False, description="详细日志")
+    jishi: JishiSection = Field(default_factory=lambda: JishiSection())
+    ddgs: DdgsSection = Field(default_factory=lambda: DdgsSection())
+    ai_translate: AiTranslateSection = Field(default_factory=lambda: AiTranslateSection())
 
 
-class BoardgameQueryTool(BaseTool):
-    """桌游信息查询工具（供 LLM 调用）"""
+class BggSearchPlugin(MaiBotPlugin):
+    plugin_name: str = "fsqhn_bgg_search_plugin"
+    enable_plugin: bool = True
+    config_model = BggSearchPluginConfig
 
-    name = "boardgame_query"
-    description = (
-        "根据桌游的中文名 / 英文名 / 黑话简称，查询该桌游的详细信息，"
-        "包括英文名、发行年份、BGG 排名、评分、重度、人数、时长、年龄、"
-        "游戏类型、游戏机制、最佳游玩人数、语言依赖、完整英文简介以及 BGG 链接。"
-    )
+    async def on_load(self) -> None:
+        self.ctx.logger.info("BGG搜索插件已加载")
 
-    parameters = [
-        (
-            "query",
-            ToolParamType.STRING,
-            "桌游名称，支持中文名/英文名/黑话，如：山屋惊魂、Betrayal at House on the Hill、小黑屋",
-            True,
-            None,
-        ),
-    ]
+    async def on_unload(self) -> None:
+        self.ctx.logger.info("BGG搜索插件已卸载")
 
-    available_for_llm = True
+    async def on_config_update(self, scope: str, config_data: Dict[str, Any], version: str) -> None:
+        if scope == CONFIG_RELOAD_SCOPE_SELF:
+            self.ctx.logger.info("插件配置已更新 version=%s", version)
 
-    async def execute(self, function_args: dict):
-        query = function_args.get("query", "").strip()
-        if not query:
-            return {"name": self.name, "content": "查询失败：未提供桌游名称。"}
+    # ============ LLM 调用 ============
+    async def _call_llm_text(self, prompt: str, model: str = "utils") -> str | None:
+        log = self.ctx.logger
+        try:
+            result = await asyncio.wait_for(self.ctx.llm.generate(prompt=prompt, model=model), timeout=60)
+            result = _peel_envelope(result)
+            if not isinstance(result, dict):
+                return None
+            success = bool(result.get("success", False))
+            response_text = str(result.get("response") or "")
+            if not success:
+                log.error("[LLM] 调用失败: %s", result.get("error"))
+                return None
+            return response_text or None
+        except Exception as e:
+            log.error("[LLM] 调用异常: %s", e)
+            return None
 
-        ddgs_proxy = self.get_config("ddgs.proxy", None)
-        verbose = self.get_config("plugin.verbose_logging", False)
+    def _make_ddg_llm_caller(self, model: str = "utils") -> Callable[[str], Awaitable[str]]:
+        async def caller(prompt: str) -> str:
+            r = await self._call_llm_text(prompt, model=model)
+            if not r:
+                raise ValueError("LLM返回空")
+            return r
+        return caller
 
-        details = await resolve_boardgame_by_cn_name(
-            cn_name=query,
-            proxy=ddgs_proxy,
-            verbose=verbose,
-        )
+    # ============ 工具 ============
+    @Tool("boardgame_query", brief_description="根据桌游中文名/英文名/黑话简称查询详细信息", parameters=[ToolParameterInfo(name="query", param_type=ToolParamType.STRING, description="桌游名称", required=True)])
+    async def handle_boardgame_query(self, query: str, **kwargs: Any) -> Dict[str, Any]:
+        cfg = self.config
+        log = self.ctx.logger
+        try:
+            details = await resolve_boardgame_by_cn_name(
+                cn_name=query, proxy=cfg.ddgs.proxy or None, verbose=cfg.verbose_logging,
+                jishi_cookie=cfg.jishi.cookie or None, llm_caller=self._make_ddg_llm_caller(), custom_logger=log
+            )
+        except Exception as e:
+            return {"name": "boardgame_query", "content": f"查询出错: {e}"}
+        if not details:
+            return {"name": "boardgame_query", "content": f"未找到桌游「{query}」"}
+        if details.get("bgg_failed"):
+            return {"name": "boardgame_query", "content": f"找到「{details.get('cn_name')}」但BGG无法获取详情"}
+        content, data = await self._format_boardgame_reply(details, cfg=cfg)
+        return {"name": "boardgame_query", "content": content, "data": data}
+
+    # ============ 命令：/桌游 ============
+    @Command("boardgame", description="查询桌游信息", pattern=r"^/桌游\s+(?P<keyword>.+)$", timeout=90)
+    async def handle_boardgame_command(self, **kwargs: Any) -> Tuple[bool, str, bool]:
+        matched = kwargs.get("matched_groups", {})
+        keyword = matched.get("keyword", "").strip()
+        stream_id = kwargs["stream_id"]
+        if not keyword:
+            await self.ctx.send.text("请输入桌游名称，例如：/桌游 肥肠面", stream_id)
+            return True, "未提供关键词", True
+
+        await self.ctx.send.text(f"🔍 正在查询桌游：{keyword}...", stream_id)
+
+        cfg = self.config
+        log = self.ctx.logger
+        llm_caller = self._make_ddg_llm_caller()
+
+        try:
+            details = await resolve_boardgame_by_cn_name(
+                cn_name=keyword, proxy=cfg.ddgs.proxy or None, verbose=cfg.verbose_logging,
+                jishi_cookie=cfg.jishi.cookie or None, llm_caller=llm_caller, custom_logger=log
+            )
+        except Exception as e:
+            log.error("[调试] resolve 异常: %s", e)
+            await self.ctx.send.text(f"❌ 查询出错: {e}", stream_id)
+            return True, "异常", True
 
         if not details:
-            return {
-                "name": self.name,
-                "content": f"未找到桌游「{query}」的相关信息，请尝试更换更准确的名称。",
-            }
+            await self.ctx.send.text(f"😔 未找到桌游「{keyword}」的相关信息", stream_id)
+            return True, "未找到", True
 
-        bgg_failed = details.get("bgg_failed", False)
-        if bgg_failed:
-            en_name = details.get("name", "")
-            cn_name = details.get("cn_name", query)
-            return {
-                "name": self.name,
-                "content": (
-                    f"找到了桌游「{cn_name}」（英文名：{en_name}），"
-                    "但暂时无法从 BGG 获取详细信息（评分、排名、人数等）。"
-                ),
-            }
+        if details.get("bgg_failed"):
+            # 补回：BGG失败时的数据来源展示
+            name_source = details.get("_name_source", "未知")
+            bgg_source = details.get("_bgg_source", "未知")
+            source_text = f"📛 名称来源：{name_source}\n📚 详情来源：{bgg_source}"
+            text = (
+                f"🇨🇳 中文名：{details.get('cn_name')}\n"
+                f"🇺🇸 英文名：{details.get('name')}\n\n"
+                f"⚠️ 注意：BGG 暂时无法访问，未能获取详细信息（评分、排名、玩家数等）\n"
+                f"{source_text}"
+            )
+            if details.get("cn_description"):
+                text += f"\n📝 {details['cn_description']}"
+            await self.ctx.send.text(text, stream_id)
+            return True, "BGG未响应", True
 
+        content, data = await self._format_boardgame_reply(details, cfg=cfg)
+        await self.ctx.send.text(content, stream_id)
+        
+        if data.get("image"):
+            await self._try_send_image(data["image"], stream_id=stream_id, proxy=cfg.ddgs.proxy or None)
+        return True, f"已查询: {details.get('name')}", True
+
+    # ============ 命令：/桌游登记 ============
+    @Command("boardgame_register", description="登记或删除桌游中英文名", pattern=r"^/桌游登记\s+(?P<cn_name>[^/]+)/(?P<en_name>[^/]*)$")
+    async def handle_boardgame_register(self, **kwargs: Any) -> Tuple[bool, str, bool]:
+        matched = kwargs.get("matched_groups", {})
+        cn_name = matched.get("cn_name", "").strip()
+        en_name = matched.get("en_name", "").strip()
+        stream_id = kwargs["stream_id"]
+
+        if cn_name == "清空":
+            from .register import clear_alias_file
+            ok = clear_alias_file()
+            await self.ctx.send.text("✅ 已清空" if ok else "❌ 清空失败", stream_id)
+            return True, "清空", True
+
+        if en_name.lower() in ("删除", "delete", "remove", "del"):
+            from .register import load_alias_from_file, save_alias
+            existing = load_alias_from_file()
+            if cn_name in existing:
+                existing.pop(cn_name)
+                ok = save_alias(existing)
+                await self.ctx.send.text("✅ 已删除" if ok else "❌ 删除失败", stream_id)
+                return True, "删除", True
+            await self.ctx.send.text(f"⚠️「{cn_name}」未在词典中", stream_id)
+            return True, "不存在", False
+
+        if not cn_name or not en_name or not any(c.isalnum() for c in en_name):
+            await self.ctx.send.text("❌ 格式：`/桌游登记 中文名/英文名`", stream_id)
+            return True, "格式错误", True
+
+        from .register import load_alias_from_file, save_alias
+        existing = load_alias_from_file()
+        if cn_name in existing:
+            await self.ctx.send.text(f"⚠️ 已存在：{existing[cn_name]}，请先删除再录入", stream_id)
+            return True, "已存在", False
+
+        ok = save_alias({cn_name: en_name})
+        await self.ctx.send.text(f"✅ 登记：{cn_name} → {en_name}" if ok else "❌ 保存失败", stream_id)
+        return True, "成功", True
+
+    # ============ 辅助 ============
+    async def _format_boardgame_reply(self, details: Dict[str, Any], cfg: BggSearchPluginConfig) -> Tuple[str, Dict[str, Any]]:
+        cn_name = details.get("cn_name", "")
+        en_name = details.get("name", "")
         year = details.get("year", "")
         rank = details.get("rank", "N/A")
         avg = details.get("average", "N/A")
@@ -86,320 +229,76 @@ class BoardgameQueryTool(BaseTool):
         bgg_url = details.get("bgg_url", "")
         categories = details.get("categories", [])
         mechanics = details.get("mechanics", [])
+        cn_desc = details.get("cn_description") or ""
+        jishi_score = details.get("jishi_score") or ""
+        jishi_cats = details.get("jishi_categories") or []
         best_numplayers = details.get("best_numplayers", "")
-        lang_dependence = details.get("language_dependence", "")
-        cn_name = details.get("cn_name", query)
-        en_name = details.get("name", "")
-
-        desc_display = desc or "暂无简介"
-        types_str = ", ".join(categories[:6])
-        mechanics_str = ", ".join(mechanics[:6])
-
-        lines = [
-            f"游戏：{en_name}（中文名：{cn_name}）",
-            f"发行年份：{year}",
-            f"BGG 排名：{rank}",
-            f"评分：{avg}/10",
-            f"重度：{avgw}/5",
-            f"人数：{minp}-{maxp}",
-            f"时长：{mint}-{maxt} 分钟",
-            f"年龄：{minage}+",
-        ]
-
-        if best_numplayers:
-            lines.append(f"最佳游玩人数：{best_numplayers}")
-        if lang_dependence:
-            lines.append(f"语言依赖：{lang_dependence}")
-
-        lines.extend([
-            f"类型：{types_str}",
-            f"机制：{mechanics_str}",
-            f"简介：{desc_display}",
-            f"BGG 链接：{bgg_url}",
-        ])
-
-        content = "\n".join(lines)
-
-        return {
-            "name": self.name,
-            "content": content,
-            "data": {
-                "cn_name": cn_name,
-                "en_name": en_name,
-                "year": year,
-                "rank": rank,
-                "average": avg,
-                "avg_weight": avgw,
-                "min_players": minp,
-                "max_players": maxp,
-                "min_time": mint,
-                "max_time": maxt,
-                "min_age": minage,
-                "best_numplayers": best_numplayers,
-                "language_dependence": lang_dependence,
-                "categories": categories,
-                "mechanics": mechanics,
-                "description": desc_display,
-                "bgg_url": bgg_url,
-            },
-        }
-
-
-class BoardgameCommand(BaseCommand):
-    """响应 /桌游 命令"""
-
-    command_name = "boardgame"
-    command_description = (
-        "查询桌游信息（支持中文/简称/黑话，自动通过通用搜索抽取英文名），示例：/桌游 肥肠面"
-    )
-    command_pattern = r"^/桌游\s+(?P<keyword>.+)$"
-
-    async def execute(self) -> Tuple[bool, str, bool]:
-        keyword = self.matched_groups.get("keyword", "").strip()
-        if not keyword:
-            await self.send_text("请输入要查询的桌游名称，例如：/桌游 肥肠面")
-            return True, "未提供关键词", True
-
-        await self.send_text(f"🔍 正在查询桌游：{keyword}，正在抽取英文名候选...")
-
-        ddgs_proxy = self.get_config("ddgs.proxy", None)
-        verbose = self.get_config("plugin.verbose_logging", True)
-        enable_ai_translate = self.get_config("ai_translate.enabled", False)
+        lang_dep = details.get("language_dependence") or details.get("language_requirement") or ""
         
-
-        details = await resolve_boardgame_by_cn_name(
-            cn_name=keyword,
-            proxy=ddgs_proxy,
-            verbose=verbose,
-
-        )
-
-        bgg_failed = details.get("bgg_failed", False)
-        source = details.get("_source", "Unknown")
-
-        en_name = details.get("name", "")
-        cn_name = details.get("cn_name", keyword)
-
-        if bgg_failed:
-            text = (
-                f"🇨🇳 中文名：{cn_name}\n"
-                f"🇺🇸 英文名：{en_name}\n"
-                f"\n"
-                f"⚠️ 注意：BGG 暂时无法访问，未能获取详细信息（评分、排名、玩家数等）\n"
-                f"🔗 数据来源：DuckDuckGo 搜索 + LLM 提取"
-            )
-            await self.send_text(text)
-            return True, f"已提取桌游信息（BGG未响应）：{en_name}", True
-
-        year = details.get("year", "")
-        rank = details.get("rank", "N/A")
-        avg = details.get("average", "N/A")
-        avgw = details.get("avg_weight", "N/A")
-        minp = details.get("min_players", "?")
-        maxp = details.get("max_players", "?")
-        mint = details.get("min_time", "?")
-        maxt = details.get("max_time", "?")
-        minage = details.get("min_age", "?")
-        desc = details.get("description", "")
-        image = details.get("image", "")
-        bgg_id = details.get("bgg_id", "")
-        bgg_url = f"https://boardgamegeek.com/boardgame/{bgg_id}"
-        categories = details.get("categories", [])
-        mechanics = details.get("mechanics", [])
-        best_numplayers = details.get("best_numplayers", "")
-        lang_dependence = details.get("language_dependence", "")
-
-        translated_categories = []
-        translated_mechanics = []
-        translated_desc = desc
-
-        if enable_ai_translate:
-            try:
-                translate_prompt = (
-                    "请将以下桌游信息中的 '游戏类型'、'游戏机制' 和 '简介' 翻译成中文。\n"
-                    "请保持专业术语的准确性。\n"
-                    "输出格式要求（严格按照此格式，不要包含其他内容）：\n"
-                    "类型：[翻译后的类型列表，用顿号分隔]\n"
-                    "机制：[翻译后的机制列表，用顿号分隔]\n"
-                    "简介：[翻译后的简介]\n\n"
-                    "原始内容：\n"
-                    f"类型：{', '.join(categories)}\n"
-                    f"机制：{', '.join(mechanics)}\n"
-                    f"简介：{desc}\n"
-                )
-
-                logger.info("[AI 翻译] 正在请求 AI 翻译游戏信息...")
-
-                from src.plugin_system.apis import llm_api
-
-                models = llm_api.get_available_models()
-                model_config = None
-                target_key = "utils"
-                if target_key in models:
-                    model_config = models[target_key]
-                else:
-                    for name_cfg, conf in models.items():
-                        if name_cfg != "embedding":
-                            model_config = conf
-                            break
-
-                if model_config:
-                    success, ai_response, _, _ = await llm_api.generate_with_model(
-                        prompt=translate_prompt,
-                        model_config=model_config,
-                        request_type="plugin.translate",
-                    )
-                    if success and ai_response:
-                        for line in ai_response.split("\n"):
-                            if line.startswith("类型："):
-                                translated_categories = [
-                                    x.strip()
-                                    for x in line.replace("类型：", "").strip().split("、")
-                                    if x.strip()
-                                ]
-                            elif line.startswith("机制："):
-                                translated_mechanics = [
-                                    x.strip()
-                                    for x in line.replace("机制：", "").strip().split("、")
-                                    if x.strip()
-                                ]
-                            elif line.startswith("简介："):
-                                translated_desc = line.replace("简介：", "").strip()
-                        logger.info("[AI 翻译] AI 翻译完成")
-                    else:
-                        logger.warning("[AI 翻译] AI 翻译失败，回退到词典/原文")
-            except Exception as e:
-                logger.error(f"[AI 翻译] 异常: {e}")
-
-        term_map = load_terms()
-        if not translated_categories and categories:
-            translated_categories = [term_map.get(c, c) for c in categories]
-        if not translated_mechanics and mechanics:
-            translated_mechanics = [term_map.get(m, m) for m in mechanics]
-
-        categories_text = "、".join(translated_categories[:5]) if translated_categories else "暂无"
-        mechanics_text = "、".join(translated_mechanics[:5]) if translated_mechanics else "暂无"
-
-        if not enable_ai_translate:
-            desc_display = (desc or "暂无简介")[:200] + "..." if len(desc or "") > 200 else (desc or "暂无简介")
-        else:
-            desc_display = translated_desc
-
+        # 补回：提取数据来源信息
+        name_source = details.get("_name_source", "未知")
+        bgg_source = details.get("_bgg_source", "未知")
         final_query = details.get("_final_query", "")
 
-        text = (
-            f"🇨🇳 中文名：{cn_name}\n"
-            f"🇺🇸 英文名：{en_name}\n"
-            f"📅 发行年份：{year}\n"
-            f"🏆 BGG 排名：{rank}   ⭐ 评分：{avg}/10\n"
-            f"🧠 重度：{avgw}/5   👥 人数：{minp}-{maxp} 人\n"
-            f"⏳ 时长：{mint}-{maxt} 分钟   🚼 年龄：{minage}+\n"
-            f"📚 游戏类型：{categories_text}\n"
-            f"⚙️ 游戏机制：{mechanics_text}\n"
-        )
+        translated_categories, translated_mechanics, translated_desc = [], [], desc
+        if cfg.ai_translate.enabled and (categories or mechanics):
+            ai_response = await self._call_llm_text(
+                f"类型：{', '.join(categories)}\n机制：{', '.join(mechanics)}\n简介：{desc}\n\n请按'类型：\n机制：\n简介：'格式翻译为中文。"
+            )
+            if ai_response:
+                for line in ai_response.split("\n"):
+                    if line.startswith("类型："): translated_categories = [x.strip() for x in line.replace("类型：", "").split("、") if x.strip()]
+                    elif line.startswith("机制："): translated_mechanics = [x.strip() for x in line.replace("机制：", "").split("、") if x.strip()]
+                    elif line.startswith("简介："): translated_desc = line.replace("简介：", "").strip()
 
-        if best_numplayers:
-            text += f"👍 最佳人数：{best_numplayers} 人\n"
-        if lang_dependence:
-            text += f"🌍 语言依赖：{lang_dependence}\n"
+        term_map = load_terms()
+        if not translated_categories and categories: translated_categories = [term_map.get(c, c) for c in categories]
+        if not translated_mechanics and mechanics: translated_mechanics = [term_map.get(m, m) for m in mechanics]
 
-        text += (
-            f"📝 简介：{desc_display}\n"
-            f"🔗 数据来源：{source}\n"
-            f"🔗 BGG 链接：{bgg_url}"
-        )
+        desc_display = translated_desc or cn_desc or desc or "暂无简介"
+        if len(desc_display) > 300: desc_display = desc_display[:300] + "..."
 
+        lines = [
+            f"🇨🇳 中文名：{cn_name}",
+            f"🇺🇸 英文名：{en_name}",
+            f"📅 年份：{year}",
+            f"🏆 排名：{rank} ⭐ 评分：{avg}/10",
+            f"🧠 重度：{avgw}/5 👥 {minp}-{maxp}人 ⏳ {mint}-{maxt}分 🚼 {minage}+",
+            f"📚 类型：{'、'.join(translated_categories[:5]) or '暂无'}",
+            f"⚙️ 机制：{'、'.join(translated_mechanics[:5]) or '暂无'}",
+        ]
+        if jishi_score: lines.append(f"🔥 集石评分：{jishi_score}")
+        if jishi_cats: lines.append(f"🏷️ 集石分类：{'、'.join(jishi_cats)}")
+        if best_numplayers: lines.append(f"👍 最佳人数：{best_numplayers}人")
+        if lang_dep: lines.append(f"🌍 语言依赖：{lang_dep}")
+        lines.append(f"📝 {desc_display}")
+        
+        # 补回：在底部拼接数据来源
+        source_text = f"📛 名称来源：{name_source} | 📚 详情来源：{bgg_source}"
+        lines.append(source_text)
+        lines.append(f"🔗 {bgg_url}")
+        
+        text = "\n".join(lines)
+        
+        # 补回：如果有最终命中搜索词，在最前面加提示
         if final_query:
             text = f"🔍 最终通过搜索词「{final_query}」命中 BGG 条目。\n\n" + text
 
-        await self.send_text(text)
+        data = {"cn_name": cn_name, "en_name": en_name, "image": details.get("image", "")}
+        return text, data
 
-        if image:
-            try:
-                from .utils import HEADERS
-
-                img_headers = {
-                    "User-Agent": HEADERS["User-Agent"],
-                    "Accept": "image/*",
-                    "Accept-Encoding": "identity",
-                }
-                img_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True, proxy=ddgs_proxy)
-                img_resp = await img_client.get(image, headers=img_headers)
-                await img_client.aclose()
-
-                img_resp.raise_for_status()
-
-                ct = img_resp.headers.get("content-type", "").lower()
-                if not ct.startswith("image/"):
-                    logger.warning(f"[发送图片] BGG 返回的 URL 不是图片 Content-Type: {ct}, URL={image}")
-                else:
-                    img_b64 = base64.b64encode(img_resp.content).decode("utf-8")
-                    ok = await self.send_image(img_b64)
-                    if not ok:
-                        logger.error("[发送图片] send_image 返回 False")
-            except Exception as e:
-                print(f"[发送图片失败] {e}")
-                logger.error(f"[发送图片失败] {e}")
-
-        return True, f"已查询桌游：{en_name}", True
+    async def _try_send_image(self, image_url: str, stream_id: str, proxy: str | None) -> None:
+        try:
+            from .utils import HEADERS
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, proxy=proxy) as client:
+                resp = await client.get(image_url, headers={"User-Agent": HEADERS["User-Agent"], "Accept": "image/*"})
+                resp.raise_for_status()
+                if not (resp.headers.get("content-type") or "").lower().startswith("image/"):
+                    return
+                await self.ctx.send.image(image_data=base64.b64encode(resp.content).decode(), stream_id=stream_id)
+        except Exception as e:
+            self.ctx.logger.error("[图片] %s", e)
 
 
-@register_plugin
-class bggsearchplugin(BasePlugin):
-    """bgg_search_plugin插件 - 桌游信息查询"""
-
-    plugin_name: str = "bgg_search_plugin"
-    enable_plugin: bool = True
-    dependencies: List[str] = []
-    
-    # 修正缩进：
-    python_dependencies = [
-        "httpx",
-        "ddgs",
-        "beautifulsoup4"
-    ]
-    
-    config_file_name: str = "config.toml"
-
-    config_section_descriptions = {
-        "plugin": "插件启用配置",
-        "ddgs": "DuckDuckGo 搜索代理配置（如无代理可留空或删除该节）",
-        "ai_translate": "AI 翻译配置（翻译类型、机制和简介）",
-    }
-
-    config_schema = {
-        "plugin": {
-            "enabled": ConfigField(
-                type=bool,
-                default=True,
-                description="是否启用本插件",
-            ),
-            "verbose_logging": ConfigField(
-                type=bool,
-                default=False,
-                description="是否在后台显示详细日志（包括 DDG 搜索结果、AI 总结、API 返回数据等）",
-            ),
-        },
-        "ddgs": {
-            "proxy": ConfigField(
-                type=str,
-                default="",
-                description="DuckDuckGo 搜索使用的代理地址，访问BGG也会用，强烈建议配置代理，例如 'http://127.0.0.1:10809'；留空表示不使用代理",
-                example="http://127.0.0.1:10809",
-            ),
-        },
-        "ai_translate": {
-            "enabled": ConfigField(
-                type=bool,
-                default=True,
-                description="是否开启 AI 全文翻译。开启后会翻译类型、机制和简介（效果更好但速度较慢）；关闭时仅使用内置词典翻译常用术语，简介保留英文。",
-            ),
-        },
-    }
-
-    def get_plugin_components(self) -> List[Tuple[ComponentInfo, Type]]:
-        return [
-            (BoardgameCommand.get_command_info(), BoardgameCommand),
-            (BoardgameQueryTool.get_tool_info(), BoardgameQueryTool),
-        ]
-
+def create_plugin() -> BggSearchPlugin:
+    return BggSearchPlugin()

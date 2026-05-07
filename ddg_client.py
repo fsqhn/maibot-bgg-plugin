@@ -1,124 +1,68 @@
-from typing import List, Tuple, Optional
+import logging
+from typing import List, Tuple, Optional, Callable, Awaitable, Any
 from ddgs import DDGS
-from src.plugin_system.apis import llm_api
-from src.common.logger import get_logger
 
-logger = get_logger("bgg_search_plugin.ddg_client")
+logger = logging.getLogger("bgg_search_plugin.ddg_client")
 
+COMMON_TERMS_TO_FILTER = [
+    "tabletop game", "board game", "boardgame", "card game", "dice game",
+    "party game", "strategy game", "family game", "game", "tabletop",
+]
+
+def _build_extract_prompt(results: list) -> str:
+    prompt = (
+        "从以下搜索结果中提取桌游的英文名称。\n"
+        "1. 不要提取通用词汇，要具体的桌游名称\n"
+        "输出格式：\n中文名：[中文名称]\n英文名：[英文名称]\n\n"
+        "搜索结果：\n\n"
+    )
+    for idx, r in enumerate(results):
+        prompt += f"结果{idx+1}:\n标题：{r.get('title', '')}\n摘要：{r.get('body', '')[:200]}\n\n"
+    return prompt
+
+def _parse_llm_names(llm_response: str) -> Tuple[List[str], str]:
+    lines = [l.strip() for l in llm_response.split("\n") if l.strip()]
+    cn_name, en_candidates = "", []
+    for line in lines:
+        if line.startswith("中文名："): cn_name = line.replace("中文名：", "").strip()
+        elif line.startswith("英文名："):
+            en = line.replace("英文名：", "").strip()
+            if en and en.lower() not in COMMON_TERMS_TO_FILTER and len(en) >= 3 and not en.lower().startswith("http"):
+                en_candidates.append(en)
+    seen = set()
+    return [x for x in en_candidates if not (x in seen or seen.add(x))], cn_name
 
 async def fetch_english_candidates_from_ddg(
     keyword: str,
     proxy: Optional[str] = None,
     verbose: bool = False,
+    llm_caller: Optional[Callable[[str], Awaitable[str]]] = None,
+    logger: Any = None,
 ) -> Tuple[List[str], str]:
-    candidates = []
+    """DDG搜索 + LLM提取英文名。llm_caller 必须由 plugin.py 传入"""
+    log = logger or logging.getLogger("bgg_search_plugin.ddg_client")
+
+    if not llm_caller:
+        raise ValueError("缺少 llm_caller，无法调用 LLM 提取英文名")
+
     try:
-        ddgs_proxy = proxy if proxy else None
         search_query = f"{keyword}的英文名是什么"
-        if verbose:
-            logger.info(f"[DDGS 搜索] 开始搜索关键词: {search_query}")
+        if verbose: log.info("[DDG] 搜索: %s", search_query)
+        results = list(DDGS(proxy=proxy if proxy else None).text(search_query, region="zh-CN", max_results=10))
+        if verbose: log.info("[DDG] 搜索返回 %d 条结果", len(results))
+        if not results: raise ValueError("DDG搜索无结果")
 
-        results = list(DDGS(proxy=ddgs_proxy).text(search_query, region="zh-CN", max_results=20))
+        prompt = _build_extract_prompt(results)
+        if verbose: log.info("[DDG] 调用LLM提取英文名...")
+        
+        llm_response = await llm_caller(prompt)
+        if verbose: log.info("[DDG] LLM返回: %s", llm_response[:200] if llm_response else "(空)")
 
-        if verbose:
-            logger.info(f"[DDGS 搜索] 共获取 {len(results)} 条结果")
-
-        models = llm_api.get_available_models()
-        if not models:
-            print("没有可用的LLM模型")
-            return []
-
-        target_key = "utils"
-        if target_key in models:
-            model_config = models[target_key]
-            if verbose:
-                logger.info(f"[LLM 提取] 指定使用模型: {target_key}")
-        else:
-            logger.warning(f"[LLM 提取] 系统中未找到 {target_key} 模型，尝试回退策略...")
-            for name, conf in models.items():
-                if name != "replay":
-                    model_config = conf
-                    if verbose:
-                        logger.info(f"[LLM 提取] 回退使用模型: {name}")
-                    break
-
-        prompt = (
-            "从以下搜索结果中提取桌游的英文名称。\n"
-            "注意：\n"
-            "1. 请提取具体的桌游名称，不要提取通用词汇（如'tabletop game'、'board game'等）\n"
-            "2. 优先从标题中提取，标题无英文则检查摘要\n"
-            "3. 英文名称通常包含多个单词，不是单个通用词\n"
-            "4. 忽略搜索结果中的广告、无关内容\n"
-            "5. 同时提取中文名称\n"
-            "\n"
-            "输出格式（严格按照此格式）：\n"
-            "中文名：[中文名称]\n"
-            "英文名：[英文名称]\n"
-            "\n"
-            "搜索结果如下：\n\n"
-        )
-        for idx, r in enumerate(results):
-            title = r.get("title", "")
-            body = r.get("body", "")
-            prompt += f"结果 {idx+1}:\n标题：{title}\n摘要：{body[:200]}...\n\n"
-
-        if verbose:
-            logger.info("[LLM 提取] 正在调用LLM处理搜索结果...")
-
-        success, llm_response, _, used_model = await llm_api.generate_with_model(
-            prompt=prompt,
-            model_config=model_config,
-            request_type="plugin.generate",
-        )
-
-        if not success or not llm_response or not llm_response.strip():
-            raise ValueError("LLM生成失败或返回空结果")
-
-        lines = [line.strip() for line in llm_response.split("\n") if line.strip()]
-        cn_name = ""
-        en_candidates = []
-
-        COMMON_TERMS_TO_FILTER = [
-            "tabletop game",
-            "board game",
-            "boardgame",
-            "card game",
-            "dice game",
-            "party game",
-            "strategy game",
-            "family game",
-            "game",
-            "tabletop",
-        ]
-
-        for line in lines:
-            if line.startswith("中文名："):
-                cn_name = line.replace("中文名：", "").strip()
-            elif line.startswith("英文名："):
-                en_name = line.replace("英文名：", "").strip()
-                if en_name:
-                    en_name_lower = en_name.lower().strip()
-                    if (
-                        en_name_lower not in COMMON_TERMS_TO_FILTER
-                        and len(en_name) >= 3
-                        and not en_name_lower.startswith("http")
-                    ):
-                        en_candidates.append(en_name)
-
-        if not en_candidates:
-            raise ValueError("LLM未提取到有效英文名")
-
-        seen = set()
-        unique_candidates = []
-        for name in en_candidates:
-            if name not in seen:
-                seen.add(name)
-                unique_candidates.append(name)
-
-        if verbose:
-            logger.info(f"[LLM 提取] 中文名: {cn_name}, 英文名候选: {unique_candidates}")
-        return unique_candidates, cn_name
-
+        unique, cn_name = _parse_llm_names(llm_response)
+        if not unique: raise ValueError(f"LLM未提取到有效英文名，原始返回: {llm_response[:200]}")
+        
+        if verbose: log.info("[DDG] 最终结果: cn=%s, en_candidates=%s", cn_name, unique)
+        return unique, cn_name
     except Exception as e:
-        logger.error(f"[LLM 提取异常] {e}")
+        if log: log.error("[DDG] 异常: %s", e)
         raise
