@@ -15,18 +15,26 @@ HEADERS = {
     "Connection": "keep-alive",
 }
 
+# ===== BGG API2（官方推荐） =====
 BGG_API_SEARCH_V2 = "https://boardgamegeek.com/xmlapi2/search"
-BGG_API_SEARCH_V1 = "https://boardgamegeek.com/xmlapi/search"
 BGG_API_THING = "https://boardgamegeek.com/xmlapi2/thing"
 BGG_SEARCH_URL = "https://boardgamegeek.com/geeksearch.php"
 BGG_BASE_URL = "https://boardgamegeek.com"
 
+# ===== “Powered by BGG” logo（XML API 条款要求展示） =====
+BGG_POWERED_BY_IMAGE_URL = (
+    "https://cf.geekdo-images.com/HZy35cmzmmyV9BarSuk6ug__imagepage/img/"
+    "FOGhR5OgYhcg-1jdqT5i5W8Xfbg=/fit-in/900x600/filters:no_upscale():strip_icc()/pic7779581.png"
+)
+
 # ==================== BGG API Token (硬编码) ====================
 BGG_API_TOKEN = "a45425e8-aee4-42f2-9111-2190723fbb2b"
 
-
 def make_bgg_api_headers(api_token: Optional[str] = None) -> dict:
-    """为 BGG API 请求构造请求头。"""
+    """
+    为 BGG API 请求构造请求头。
+    官方建议使用 xmlapi2 根路径，并带 Bearer token。
+    """
     headers = {
         "User-Agent": HEADERS["User-Agent"],
         "Accept": "application/xml, text/xml, */*; q=0.01",

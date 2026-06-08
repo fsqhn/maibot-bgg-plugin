@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "桌游搜索插件 (bgg_search_plugin)",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "description": "利用集石、DDGS 和 LLM 查询桌游英文名，然后从 BGG 网站获取游戏的相关基本信息",
   "author": {
     "name": "山上的小丘",

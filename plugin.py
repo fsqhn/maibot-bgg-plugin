@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import os
 import base64
 import asyncio
@@ -16,7 +15,7 @@ from maibot_sdk import (
 )
 from maibot_sdk.types import ToolParameterInfo, ToolParamType
 
-# 递归剥皮逻辑（和能跑的示例一致）
+
 def _peel_envelope(result: Any, *, max_depth: int = 4) -> Any:
     for _ in range(max_depth):
         if not isinstance(result, dict):
@@ -30,33 +29,43 @@ def _peel_envelope(result: Any, *, max_depth: int = 4) -> Any:
     return result
 
 from .bgg_client import resolve_boardgame_by_cn_name
-from .utils import load_terms
+from .utils import load_terms, BGG_POWERED_BY_IMAGE_URL
 
 
-# ===== 配置 =====
-class PluginMetaSection(PluginConfigBase):
-    __ui_label__ = "插件元信息"
+class PluginSection(PluginConfigBase):
+    __ui_label__ = "插件基础配置"
     config_version: str = Field(default="1.0.0", description="配置版本号")
+    enabled: bool = Field(default=True, description="是否启用插件")
+    verbose_logging: bool = Field(default=False, description="详细日志")
+
 
 class JishiSection(PluginConfigBase):
     __ui_label__ = "集石数据源"
     cookie: str = Field(default="", description="集石Cookie")
 
+
 class DdgsSection(PluginConfigBase):
     __ui_label__ = "DDG搜索"
     proxy: str = Field(default="", description="DDG代理地址")
+
+
+class TavilySection(PluginConfigBase):
+    __ui_label__ = "Tavily搜索"
+    api_key: str = Field(default="", description="Tavily API Key")
+    search_depth: str = Field(default="basic", description="搜索深度：basic或advanced")
+
 
 class AiTranslateSection(PluginConfigBase):
     __ui_label__ = "AI翻译"
     enabled: bool = Field(default=True, description="是否开启AI翻译")
 
+
 class BggSearchPluginConfig(PluginConfigBase):
     __ui_label__ = "BGG搜索插件"
-    plugin: PluginMetaSection = Field(default_factory=PluginMetaSection)
-    enabled: bool = Field(default=True, description="是否启用")
-    verbose_logging: bool = Field(default=False, description="详细日志")
+    plugin: PluginSection = Field(default_factory=PluginSection)
     jishi: JishiSection = Field(default_factory=lambda: JishiSection())
     ddgs: DdgsSection = Field(default_factory=lambda: DdgsSection())
+    tavily: TavilySection = Field(default_factory=lambda: TavilySection())
     ai_translate: AiTranslateSection = Field(default_factory=lambda: AiTranslateSection())
 
 
@@ -75,7 +84,6 @@ class BggSearchPlugin(MaiBotPlugin):
         if scope == CONFIG_RELOAD_SCOPE_SELF:
             self.ctx.logger.info("插件配置已更新 version=%s", version)
 
-    # ============ LLM 调用 ============
     async def _call_llm_text(self, prompt: str, model: str = "utils") -> str | None:
         log = self.ctx.logger
         try:
@@ -101,45 +109,56 @@ class BggSearchPlugin(MaiBotPlugin):
             return r
         return caller
 
-    # ============ 工具 ============
     @Tool("boardgame_query", brief_description="根据桌游中文名/英文名/黑话简称查询详细信息", parameters=[ToolParameterInfo(name="query", param_type=ToolParamType.STRING, description="桌游名称", required=True)])
     async def handle_boardgame_query(self, query: str, **kwargs: Any) -> Dict[str, Any]:
         cfg = self.config
         log = self.ctx.logger
         try:
             details = await resolve_boardgame_by_cn_name(
-                cn_name=query, proxy=cfg.ddgs.proxy or None, verbose=cfg.verbose_logging,
-                jishi_cookie=cfg.jishi.cookie or None, llm_caller=self._make_ddg_llm_caller(), custom_logger=log
+                cn_name=query,
+                proxy=cfg.ddgs.proxy or None,
+                verbose=cfg.plugin.verbose_logging,
+                jishi_cookie=cfg.jishi.cookie or None,
+                tavily_api_key=cfg.tavily.api_key or None,
+                llm_caller=self._make_ddg_llm_caller(),
+                custom_logger=log,
             )
         except Exception as e:
             return {"name": "boardgame_query", "content": f"查询出错: {e}"}
+
         if not details:
             return {"name": "boardgame_query", "content": f"未找到桌游「{query}」"}
+
         if details.get("bgg_failed"):
             return {"name": "boardgame_query", "content": f"找到「{details.get('cn_name')}」但BGG无法获取详情"}
+
         content, data = await self._format_boardgame_reply(details, cfg=cfg)
         return {"name": "boardgame_query", "content": content, "data": data}
 
-    # ============ 命令：/桌游 ============
     @Command("boardgame", description="查询桌游信息", pattern=r"^/桌游\s+(?P<keyword>.+)$", timeout=90)
     async def handle_boardgame_command(self, **kwargs: Any) -> Tuple[bool, str, bool]:
         matched = kwargs.get("matched_groups", {})
         keyword = matched.get("keyword", "").strip()
         stream_id = kwargs["stream_id"]
+
         if not keyword:
             await self.ctx.send.text("请输入桌游名称，例如：/桌游 肥肠面", stream_id)
             return True, "未提供关键词", True
 
         await self.ctx.send.text(f"🔍 正在查询桌游：{keyword}...", stream_id)
-
         cfg = self.config
         log = self.ctx.logger
         llm_caller = self._make_ddg_llm_caller()
 
         try:
             details = await resolve_boardgame_by_cn_name(
-                cn_name=keyword, proxy=cfg.ddgs.proxy or None, verbose=cfg.verbose_logging,
-                jishi_cookie=cfg.jishi.cookie or None, llm_caller=llm_caller, custom_logger=log
+                cn_name=keyword,
+                proxy=cfg.ddgs.proxy or None,
+                verbose=cfg.plugin.verbose_logging,
+                jishi_cookie=cfg.jishi.cookie or None,
+                tavily_api_key=cfg.tavily.api_key or None,
+                llm_caller=llm_caller,
+                custom_logger=log,
             )
         except Exception as e:
             log.error("[调试] resolve 异常: %s", e)
@@ -151,16 +170,12 @@ class BggSearchPlugin(MaiBotPlugin):
             return True, "未找到", True
 
         if details.get("bgg_failed"):
-            # 补回：BGG失败时的数据来源展示
+            source = details.get("_source", "未知")
             name_source = details.get("_name_source", "未知")
-            bgg_source = details.get("_bgg_source", "未知")
-            source_text = f"📛 名称来源：{name_source}\n📚 详情来源：{bgg_source}"
-            text = (
-                f"🇨🇳 中文名：{details.get('cn_name')}\n"
-                f"🇺🇸 英文名：{details.get('name')}\n\n"
-                f"⚠️ 注意：BGG 暂时无法访问，未能获取详细信息（评分、排名、玩家数等）\n"
-                f"{source_text}"
-            )
+            SOURCE_FRIENDLY = {"集石→BGG(详情获取失败)": "🔴 集石→BGG详情获取失败", "全部方案失败": "🔴 全部方案失败"}
+            source_display = SOURCE_FRIENDLY.get(source, f"ℹ️ {source}")
+            text = (f"🇨🇳 中文名：{details.get('cn_name')}\n🇺🇸 英文名：{details.get('name')}\n\n"
+                    f"⚠️ 注意：BGG 暂时无法访问，未能获取详细信息\n📋 查询方案：{source_display}")
             if details.get("cn_description"):
                 text += f"\n📝 {details['cn_description']}"
             await self.ctx.send.text(text, stream_id)
@@ -168,12 +183,19 @@ class BggSearchPlugin(MaiBotPlugin):
 
         content, data = await self._format_boardgame_reply(details, cfg=cfg)
         await self.ctx.send.text(content, stream_id)
-        
+
+        images_to_send = []
         if data.get("image"):
-            await self._try_send_image(data["image"], stream_id=stream_id, proxy=cfg.ddgs.proxy or None)
+            images_to_send.append(data["image"])
+        bgg_source = details.get("_bgg_source", "")
+        if bgg_source and bgg_source != "无":
+            images_to_send.append(BGG_POWERED_BY_IMAGE_URL)
+
+        for img_url in images_to_send:
+            await self._try_send_image(img_url, stream_id=stream_id, proxy=cfg.ddgs.proxy or None)
+
         return True, f"已查询: {details.get('name')}", True
 
-    # ============ 命令：/桌游登记 ============
     @Command("boardgame_register", description="登记或删除桌游中英文名", pattern=r"^/桌游登记\s+(?P<cn_name>[^/]+)/(?P<en_name>[^/]*)$")
     async def handle_boardgame_register(self, **kwargs: Any) -> Tuple[bool, str, bool]:
         matched = kwargs.get("matched_groups", {})
@@ -212,7 +234,6 @@ class BggSearchPlugin(MaiBotPlugin):
         await self.ctx.send.text(f"✅ 登记：{cn_name} → {en_name}" if ok else "❌ 保存失败", stream_id)
         return True, "成功", True
 
-    # ============ 辅助 ============
     async def _format_boardgame_reply(self, details: Dict[str, Any], cfg: BggSearchPluginConfig) -> Tuple[str, Dict[str, Any]]:
         cn_name = details.get("cn_name", "")
         en_name = details.get("name", "")
@@ -234,29 +255,58 @@ class BggSearchPlugin(MaiBotPlugin):
         jishi_cats = details.get("jishi_categories") or []
         best_numplayers = details.get("best_numplayers", "")
         lang_dep = details.get("language_dependence") or details.get("language_requirement") or ""
-        
-        # 补回：提取数据来源信息
-        name_source = details.get("_name_source", "未知")
-        bgg_source = details.get("_bgg_source", "未知")
+
+        source = details.get("_source", "未知")
+        name_source = details.get("_name_source", "")
+        bgg_source = details.get("_bgg_source", "")
         final_query = details.get("_final_query", "")
+
+        SOURCE_FRIENDLY = {
+            "集石→BGG_API2": "🟢 集石提供名称 → BGG API2获取详情",
+            "集石→BGG网页抓取": "🟡 集石提供名称 → BGG网页抓取详情",
+            "集石→BGG(详情获取失败)": "🔴 集石提供名称 → BGG详情获取失败",
+            "BGG_API2": "🟢 BGG API2 直接搜索",
+            "BGG网页抓取(API获ID)": "🟡 BGG API2搜索 → 网页抓取详情",
+            "BGG网页搜索": "🟡 BGG 网页搜索 + 网页抓取",
+            "DDG+AI→BGG_API2": "🟠 DDG+AI翻译英文名 → BGG API2",
+            "DDG+AI→BGG网页抓取(API获ID)": "🟠 DDG+AI翻译英文名 → BGG网页抓取",
+            "DDG+AI→BGG网页搜索": "🟠 DDG+AI翻译英文名 → BGG网页搜索",
+            "Tavily+AI→BGG_API2": "🟢 Tavily+AI翻译英文名 → BGG API2",
+            "Tavily+AI→BGG网页抓取(API获ID)": "🟡 Tavily+AI翻译英文名 → BGG网页抓取",
+            "Tavily+AI→BGG网页搜索": "🟡 Tavily+AI翻译英文名 → BGG网页搜索",
+            "DDG+Tavily+AI→BGG_API2": "🟢 DDG+Tavily融合搜索+AI → BGG API2",
+            "DDG+Tavily+AI→BGG网页抓取(API获ID)": "🟡 DDG+Tavily融合搜索+AI → BGG网页抓取",
+            "DDG+Tavily+AI→BGG网页搜索": "🟡 DDG+Tavily融合搜索+AI → BGG网页搜索",
+            "词典→BGG_API2": "🟢 词典 → BGG API2",
+            "词典→BGG网页抓取(API获ID)": "🟡 词典 → BGG网页抓取",
+            "词典→BGG网页搜索": "🟡 词典 → BGG网页搜索",
+            "集石→DDG+AI→BGG_API2": "🟠 集石(转DDG) → BGG API2",
+            "集石→DDG+AI→BGG网页抓取(API获ID)": "🟠 集石(转DDG) → BGG网页抓取",
+            "全部方案失败": "🔴 全部方案失败",
+        }
+        source_display = SOURCE_FRIENDLY.get(source, f"ℹ️ {source}")
 
         translated_categories, translated_mechanics, translated_desc = [], [], desc
         if cfg.ai_translate.enabled and (categories or mechanics):
-            ai_response = await self._call_llm_text(
-                f"类型：{', '.join(categories)}\n机制：{', '.join(mechanics)}\n简介：{desc}\n\n请按'类型：\n机制：\n简介：'格式翻译为中文。"
-            )
+            ai_response = await self._call_llm_text(f"类型：{', '.join(categories)}\n机制：{', '.join(mechanics)}\n简介：{desc}\n\n请按'类型：\n机制：\n简介：'格式翻译为中文。")
             if ai_response:
                 for line in ai_response.split("\n"):
-                    if line.startswith("类型："): translated_categories = [x.strip() for x in line.replace("类型：", "").split("、") if x.strip()]
-                    elif line.startswith("机制："): translated_mechanics = [x.strip() for x in line.replace("机制：", "").split("、") if x.strip()]
-                    elif line.startswith("简介："): translated_desc = line.replace("简介：", "").strip()
+                    if line.startswith("类型："):
+                        translated_categories = [x.strip() for x in line.replace("类型：", "").split("、") if x.strip()]
+                    elif line.startswith("机制："):
+                        translated_mechanics = [x.strip() for x in line.replace("机制：", "").split("、") if x.strip()]
+                    elif line.startswith("简介："):
+                        translated_desc = line.replace("简介：", "").strip()
 
         term_map = load_terms()
-        if not translated_categories and categories: translated_categories = [term_map.get(c, c) for c in categories]
-        if not translated_mechanics and mechanics: translated_mechanics = [term_map.get(m, m) for m in mechanics]
+        if not translated_categories and categories:
+            translated_categories = [term_map.get(c, c) for c in categories]
+        if not translated_mechanics and mechanics:
+            translated_mechanics = [term_map.get(m, m) for m in mechanics]
 
         desc_display = translated_desc or cn_desc or desc or "暂无简介"
-        if len(desc_display) > 300: desc_display = desc_display[:300] + "..."
+        if len(desc_display) > 300:
+            desc_display = desc_display[:300] + "..."
 
         lines = [
             f"🇨🇳 中文名：{cn_name}",
@@ -267,24 +317,26 @@ class BggSearchPlugin(MaiBotPlugin):
             f"📚 类型：{'、'.join(translated_categories[:5]) or '暂无'}",
             f"⚙️ 机制：{'、'.join(translated_mechanics[:5]) or '暂无'}",
         ]
-        if jishi_score: lines.append(f"🔥 集石评分：{jishi_score}")
-        if jishi_cats: lines.append(f"🏷️ 集石分类：{'、'.join(jishi_cats)}")
-        if best_numplayers: lines.append(f"👍 最佳人数：{best_numplayers}人")
-        if lang_dep: lines.append(f"🌍 语言依赖：{lang_dep}")
-        lines.append(f"📝 {desc_display}")
-        
-        # 补回：在底部拼接数据来源
-        source_text = f"📛 名称来源：{name_source} | 📚 详情来源：{bgg_source}"
-        lines.append(source_text)
-        lines.append(f"🔗 {bgg_url}")
-        
-        text = "\n".join(lines)
-        
-        # 补回：如果有最终命中搜索词，在最前面加提示
-        if final_query:
-            text = f"🔍 最终通过搜索词「{final_query}」命中 BGG 条目。\n\n" + text
+        if jishi_score:
+            lines.append(f"🔥 集石评分：{jishi_score}")
+        if jishi_cats:
+            lines.append(f"🏷️ 集石分类：{'、'.join(jishi_cats)}")
+        if best_numplayers:
+            lines.append(f"👍 最佳人数：{best_numplayers}人")
+        if lang_dep:
+            lines.append(f"🌍 语言依赖：{lang_dep}")
 
-        data = {"cn_name": cn_name, "en_name": en_name, "image": details.get("image", "")}
+        lines.append(f"📝 {desc_display}")
+        lines.append(f"\n📋 查询方案：{source_display}")
+        if final_query:
+            lines.append(f"🔍 最终通过搜索词「{final_query}」命中 BGG 条目")
+        if bgg_source and bgg_source != "无":
+            lines.append("ℹ️ Powered by BGG（logo 将单独发送）")
+        lines.append(f"🔗 {bgg_url}")
+
+        text = "\n".join(lines)
+        image_url = details.get("image", "")
+        data = {"cn_name": cn_name, "en_name": en_name, "image": image_url}
         return text, data
 
     async def _try_send_image(self, image_url: str, stream_id: str, proxy: str | None) -> None:

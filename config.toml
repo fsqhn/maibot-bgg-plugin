@@ -1,13 +1,17 @@
 [plugin]
 config_version = "1.0.0"
-
 enabled = true
+verbose_logging = false 
 
 [jishi]
 cookie = ""
 
 [ddgs]
 proxy = ""
+
+[tavily]
+api_key = ""           # 填入你的 Tavily API Key
+search_depth = "basic" # 可选 "basic" 或 "advanced"
 
 [ai_translate]
 enabled = true
