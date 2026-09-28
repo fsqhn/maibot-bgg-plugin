@@ -1,5 +1,6 @@
 from typing import Optional, Any, Callable, Awaitable, List, Tuple
 import logging
+import traceback
 import httpx
 
 logger = logging.getLogger("bgg_search_plugin.bgg_client")
@@ -75,6 +76,25 @@ async def resolve_boardgame_by_cn_name(
 
     client = httpx.AsyncClient(timeout=20.0, proxy=proxy)
     try:
+        try:
+            return await _resolve_inner(
+                cn_name, client, proxy, verbose, api_token, jishi_cookie,
+                tavily_api_key, llm_caller, log, candidates, from_alias, extracted_cn_name,
+            )
+        except Exception as e:
+            log.error(f"[resolve_boardgame_by_cn_name] 内部异常: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+            return None
+    finally:
+        await client.aclose()
+
+
+async def _resolve_inner(
+    cn_name: str, client: httpx.AsyncClient, proxy: Optional[str],
+    verbose: bool, api_token: Optional[str], jishi_cookie: Optional[str],
+    tavily_api_key: Optional[str], llm_caller: Optional[Callable[[str], Awaitable[str]]],
+    log: Any, candidates: List[str], from_alias: bool, extracted_cn_name: str,
+) -> Optional[dict]:
+    try:
         # Step 2: 集石
         jishi_result = None
         if jishi_cookie and not from_alias:
@@ -83,7 +103,7 @@ async def resolve_boardgame_by_cn_name(
             if jishi_result:
                 if jishi_result.get("bgg_id"):
                     if verbose: log.info(f"[流程] 集石命中 (BGG ID={jishi_result['bgg_id']})，获取BGG详情")
-                    details = await bgg_thing_details_api(jishi_result["bgg_id"], client, verbose, api_token, custom_logger)
+                    details = await bgg_thing_details_api(jishi_result["bgg_id"], client, verbose, api_token, log)
                     if details:
                         details = _enrich_with_jishi_info(details, jishi_result)
                         details.update({"_source": "集石→BGG_API2", "_name_source": "集石", "_bgg_source": "BGG_API2"})
@@ -115,7 +135,7 @@ async def resolve_boardgame_by_cn_name(
                 unique_search.append(s)
         if verbose: log.info(f"[流程] Step 3: BGG直接搜索(API2)，候选: {unique_search}")
         for q in unique_search:
-            result = await _try_bgg_full_search(q, client, verbose, api_token, custom_logger)
+            result = await _try_bgg_full_search(q, client, verbose, api_token, log)
             if result:
                 details, bgg_source = result
                 details["_final_query"] = q
@@ -218,7 +238,7 @@ async def resolve_boardgame_by_cn_name(
                 ddg_search.append(c)
         if verbose and ddg_search: log.info(f"[流程] {search_source_used} 候选: {ddg_search}")
         for q in ddg_search:
-            result = await _try_bgg_full_search(q, client, verbose, api_token, custom_logger)
+            result = await _try_bgg_full_search(q, client, verbose, api_token, log)
             if result:
                 details, bgg_source = result
                 details["_final_query"] = q
