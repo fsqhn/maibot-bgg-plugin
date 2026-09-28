@@ -1,6 +1,7 @@
 from typing import Optional, Any, List
 import logging
 import asyncio
+import traceback
 import httpx
 import xml.etree.ElementTree as ET
 
@@ -69,7 +70,7 @@ async def bgg_search_api_candidates(
         elif resp is not None:
             log.warning(f"[BGG API V2] 搜索状态码异常: {resp.status_code}")
     except Exception as e:
-        log.error(f"[BGG API V2] 搜索异常: {type(e).__name__}: {e}")
+        log.error(f"[BGG API V2] 搜索异常: {type(e).__name__}: {e}\n{traceback.format_exc()}")
 
     seen_ids = set()
     unique = []
@@ -97,93 +98,104 @@ async def bgg_thing_details_api(
                 await asyncio.sleep(3)
                 continue
             if resp.status_code != 200:
+                log.warning(f"[BGG API 详情] 非200状态码: {resp.status_code}, body={resp.text[:300]}")
                 return None
             xml_text = resp.text
             break
         except Exception as e:
-            log.error(f"[BGG API 详情] 请求异常: {e}")
+            log.error(f"[BGG API 详情] 请求异常: {type(e).__name__}: {e}\n{traceback.format_exc()}")
             if attempt == max_retries - 1: return None
             await asyncio.sleep(2)
-    if resp is None: return None
-    if not xml_text: return None
+    if resp is None:
+        log.error(f"[BGG API 详情] 全部重试后无响应 (game_id={game_id})")
+        return None
+    if not xml_text:
+        log.error(f"[BGG API 详情] XML内容为空 (game_id={game_id})")
+        return None
 
     try:
         root = ET.fromstring(xml_text.encode("utf-8"))
     except ET.ParseError as e:
-        log.error(f"[BGG API 详情] XML 解析失败: {e}")
+        log.error(f"[BGG API 详情] XML 解析失败: {e}\n前500字符: {xml_text[:500]}")
         return None
 
-    item = root.find(".//item[@type='boardgame']")
-    if item is None: return None
+    try:
+        item = root.find(".//item[@type='boardgame']")
+        if item is None:
+            log.warning(f"[BGG API 详情] 未找到 type='boardgame' 的 item (game_id={game_id})")
+            return None
 
-    import html
-    def get_attr(parent, tag, attr="value", default="?"):
-        node = parent.find(tag)
-        return node.get(attr, default) if node is not None else default
-    def get_text(parent, tag, default=""):
-        node = parent.find(tag)
-        return html.unescape(node.text) if node is not None and node.text else default
+        import html
+        def get_attr(parent, tag, attr="value", default="?"):
+            node = parent.find(tag)
+            return node.get(attr, default) if node is not None else default
+        def get_text(parent, tag, default=""):
+            node = parent.find(tag)
+            return html.unescape(node.text) if node is not None and node.text else default
 
-    name_node = item.find("./name[@type='primary']")
-    game_name = name_node.get("value") if name_node is not None else "Unknown"
-    rank_node = item.find(".//statistics/ratings/ranks/rank[@name='boardgame']")
-    overall_rank = rank_node.get("value") if rank_node is not None else "N/A"
-    strategy_rank_node = item.find(".//statistics/ratings/ranks/rank[@name='strategygames']")
-    strategy_rank = strategy_rank_node.get("value") if strategy_rank_node is not None else "N/A"
+        name_node = item.find("./name[@type='primary']")
+        game_name = name_node.get("value") if name_node is not None else "Unknown"
+        rank_node = item.find(".//statistics/ratings/ranks/rank[@name='boardgame']")
+        overall_rank = rank_node.get("value") if rank_node is not None else "N/A"
+        strategy_rank_node = item.find(".//statistics/ratings/ranks/rank[@name='strategygames']")
+        strategy_rank = strategy_rank_node.get("value") if strategy_rank_node is not None else "N/A"
 
-    categories = [cat_node.get("value", "") for cat_node in item.findall(".//link[@type='boardgamecategory']") if cat_node.get("value")]
-    mechanics = [mech_node.get("value", "") for mech_node in item.findall(".//link[@type='boardgamemechanic']") if mech_node.get("value")]
+        categories = [cat_node.get("value", "") for cat_node in item.findall(".//link[@type='boardgamecategory']") if cat_node.get("value")]
+        mechanics = [mech_node.get("value", "") for mech_node in item.findall(".//link[@type='boardgamemechanic']") if mech_node.get("value")]
 
-    best_numplayers = ""
-    best_poll = item.find(".//poll[@name='suggested_numplayers']")
-    if best_poll is not None:
-        best_votes = 0
-        for result_node in best_poll.findall(".//results"):
-            numplayers = result_node.get("numplayers", "")
-            best_result = result_node.find(".//result[@value='Best']")
-            if best_result is not None:
+        best_numplayers = ""
+        best_poll = item.find(".//poll[@name='suggested_numplayers']")
+        if best_poll is not None:
+            best_votes = 0
+            for result_node in best_poll.findall(".//results"):
+                numplayers = result_node.get("numplayers", "")
+                best_result = result_node.find(".//result[@value='Best']")
+                if best_result is not None:
+                    try:
+                        numvotes = int(best_result.get("numvotes", "0") or "0")
+                    except (ValueError, TypeError):
+                        numvotes = 0
+                    if numvotes > best_votes:
+                        best_votes = numvotes
+                        best_numplayers = numplayers
+
+        lang_dependence = ""
+        lang_poll = item.find(".//poll[@name='language_dependence']")
+        if lang_poll is not None:
+            max_votes = -1
+            best_result = None
+            for result_node in lang_poll.findall(".//result"):
                 try:
-                    numvotes = int(best_result.get("numvotes", "0") or "0")
-                except (ValueError, TypeError):
+                    numvotes = int(result_node.get("numvotes", "0"))
+                except ValueError:
                     numvotes = 0
-                if numvotes > best_votes:
-                    best_votes = numvotes
-                    best_numplayers = numplayers
+                if numvotes > max_votes:
+                    max_votes = numvotes
+                    best_result = result_node
+            if best_result is not None:
+                lang_value = best_result.get("value", "")
+                lang_level = best_result.get("level", "")
+                if lang_value:
+                    level_map = {"1": "无需阅读", "2": "轻微依赖", "3": "中度依赖", "4": "高度依赖", "5": "极度依赖"}
+                    level_text = level_map.get(lang_level, "")
+                    lang_dependence = f"{lang_value}（{level_text}）" if level_text else lang_value
 
-    lang_dependence = ""
-    lang_poll = item.find(".//poll[@name='language_dependence']")
-    if lang_poll is not None:
-        max_votes = -1
-        best_result = None
-        for result_node in lang_poll.findall(".//result"):
-            try:
-                numvotes = int(result_node.get("numvotes", "0"))
-            except ValueError:
-                numvotes = 0
-            if numvotes > max_votes:
-                max_votes = numvotes
-                best_result = result_node
-        if best_result is not None:
-            lang_value = best_result.get("value", "")
-            lang_level = best_result.get("level", "")
-            if lang_value:
-                level_map = {"1": "无需阅读", "2": "轻微依赖", "3": "中度依赖", "4": "高度依赖", "5": "极度依赖"}
-                level_text = level_map.get(lang_level, "")
-                lang_dependence = f"{lang_value}（{level_text}）" if level_text else lang_value
-
-    image_url = get_text(item, "image") or ""
-    return {
-        "bgg_id": game_id, "name": game_name, "year": get_attr(item, "yearpublished"),
-        "description": get_text(item, "description"), "min_players": get_attr(item, "minplayers"),
-        "max_players": get_attr(item, "maxplayers"), "min_time": get_attr(item, "minplaytime"),
-        "max_time": get_attr(item, "maxplaytime"), "min_age": get_attr(item, "minage"),
-        "users_rated": get_attr(item, "statistics/ratings/usersrated"),
-        "average": get_attr(item, "statistics/ratings/average"),
-        "avg_weight": get_attr(item, "statistics/ratings/averageweight"),
-        "rank": str(overall_rank), "strategy_rank": str(strategy_rank), "image": image_url,
-        "bgg_url": f"https://boardgamegeek.com/boardgame/{game_id}", "categories": categories,
-        "mechanics": mechanics, "best_numplayers": best_numplayers, "language_dependence": lang_dependence,
-    }
+        image_url = get_text(item, "image") or ""
+        return {
+            "bgg_id": game_id, "name": game_name, "year": get_attr(item, "yearpublished"),
+            "description": get_text(item, "description"), "min_players": get_attr(item, "minplayers"),
+            "max_players": get_attr(item, "maxplayers"), "min_time": get_attr(item, "minplaytime"),
+            "max_time": get_attr(item, "maxplaytime"), "min_age": get_attr(item, "minage"),
+            "users_rated": get_attr(item, "statistics/ratings/usersrated"),
+            "average": get_attr(item, "statistics/ratings/average"),
+            "avg_weight": get_attr(item, "statistics/ratings/averageweight"),
+            "rank": str(overall_rank), "strategy_rank": str(strategy_rank), "image": image_url,
+            "bgg_url": f"https://boardgamegeek.com/boardgame/{game_id}", "categories": categories,
+            "mechanics": mechanics, "best_numplayers": best_numplayers, "language_dependence": lang_dependence,
+        }
+    except Exception as e:
+        log.error(f"[BGG API 详情] 解析返回值异常: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+        return None
 
 async def _try_bgg_full_search(
     query: str, client: httpx.AsyncClient, verbose: bool = False, api_token: Optional[str] = None, custom_logger: Any = None, max_candidates: int = 5

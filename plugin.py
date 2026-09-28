@@ -2,6 +2,7 @@ from __future__ import annotations
 import os
 import base64
 import asyncio
+import traceback
 import httpx
 from typing import Any, Dict, List, Tuple, Callable, Awaitable
 
@@ -87,7 +88,7 @@ class BggSearchPlugin(MaiBotPlugin):
     async def _call_llm_text(self, prompt: str, model: str = "utils") -> str | None:
         log = self.ctx.logger
         try:
-            result = await asyncio.wait_for(self.ctx.llm.generate(prompt=prompt, model=model), timeout=60)
+            result = await asyncio.wait_for(self.ctx.llm.generate(prompt=prompt, task_name=model or "utils"), timeout=60)
             result = _peel_envelope(result)
             if not isinstance(result, dict):
                 return None
@@ -124,6 +125,7 @@ class BggSearchPlugin(MaiBotPlugin):
                 custom_logger=log,
             )
         except Exception as e:
+            log.error("[boardgame_query] 查询异常: %s\n%s", e, traceback.format_exc())
             return {"name": "boardgame_query", "content": f"查询出错: {e}"}
 
         if not details:
@@ -161,7 +163,7 @@ class BggSearchPlugin(MaiBotPlugin):
                 custom_logger=log,
             )
         except Exception as e:
-            log.error("[调试] resolve 异常: %s", e)
+            log.error("[调试] resolve 异常: %s\n%s", e, traceback.format_exc())
             await self.ctx.send.text(f"❌ 查询出错: {e}", stream_id)
             return True, "异常", True
 
